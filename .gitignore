@@ -1,0 +1,14 @@
+# Build output
+build/
+*.o
+*.out
+a.out
+
+# Editor / tooling
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+
+# macOS
+.DS_Store
