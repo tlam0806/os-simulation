@@ -1,0 +1,269 @@
+# Machine Specification
+
+> **Status:** Draft v0.1 · 2026-10-21
+
+This document defines the simulated machine: the "hardware" that user programs run on, and the rules the kernel can rely on. The kernel itself is ordinary C++ code inside the simulator. Only user programs run on the simulated CPU.
+
+- **Part A** describes the hardware: CPU, memory, traps, timer.
+- **Part B** describes the conventions between user programs and the kernel: address space layout, program loading, system calls.
+
+Instruction behavior follows the [RISC-V Unprivileged ISA Specification](https://github.com/riscv/riscv-isa-manual/releases). This document only records the choices RISC-V leaves open and the places where we simplify.
+
+## Design principles
+
+1. **Kernel in C++, programs on the CPU.** We do not implement the RISC-V privileged architecture (privilege modes, CSRs, hardware page-table walks). When a trap happens, the simulator hands control to C++ kernel code.
+2. **Deterministic.** The same program with the same input always runs the same way. Time is counted in CPU steps, not wall-clock time, so every bug is reproducible.
+3. **Precise traps.** An instruction that traps has no effect, so the kernel can fix the cause and run it again.
+4. **Real toolchain.** User programs are written in C and compiled with standard clang (see Appendix).
+
+---
+
+# Part A — Hardware
+
+## A1. CPU
+
+| Property | Value |
+|---|---|
+| ISA | RV32IM (RV32I base + M multiply/divide extension) |
+| Registers | `x0`–`x31`, 32 bits each. `x0` always reads 0; writes to it are ignored. |
+| Program counter | `pc`, 32 bits |
+| Byte order | Little-endian, for both instructions and data |
+| Instruction size | 32 bits, always 4-byte aligned (no compressed instructions) |
+| Execution model | One instruction per step. Single core, no pipeline, no caches. |
+
+### Instruction set (48 instructions)
+
+| Group | Instructions |
+|---|---|
+| Upper immediate | `LUI`, `AUIPC` |
+| Jumps | `JAL`, `JALR` |
+| Branches | `BEQ`, `BNE`, `BLT`, `BGE`, `BLTU`, `BGEU` |
+| Loads | `LB`, `LH`, `LW`, `LBU`, `LHU` |
+| Stores | `SB`, `SH`, `SW` |
+| ALU, immediate | `ADDI`, `SLTI`, `SLTIU`, `XORI`, `ORI`, `ANDI`, `SLLI`, `SRLI`, `SRAI` |
+| ALU, register | `ADD`, `SUB`, `SLL`, `SLT`, `SLTU`, `XOR`, `SRL`, `SRA`, `OR`, `AND` |
+| Multiply / divide | `MUL`, `MULH`, `MULHSU`, `MULHU`, `DIV`, `DIVU`, `REM`, `REMU` |
+| System | `FENCE`, `ECALL`, `EBREAK` |
+
+### Our choices where RISC-V leaves them open
+
+- **`FENCE`** is a no-op, since there is one core and no caches.
+- **`ECALL`** raises an *environment call* trap. This is how programs make system calls (B3).
+- **`EBREAK`** raises a *breakpoint* trap, reserved for a future debugger.
+- **Misaligned data access traps.** `LW`/`SW` need 4-byte-aligned addresses; `LH`/`LHU`/`SH` need 2-byte-aligned addresses. An aligned access never crosses a page boundary, so each instruction touches at most one data page. This is what makes precise traps simple (A3).
+- **Misaligned jump targets trap.** A taken branch or jump to an address that is not 4-byte aligned raises *instruction address misaligned*. The trap is reported on the branch or jump itself, not at the target.
+- **Everything else is illegal.** Any encoding not in the table raises *illegal instruction*. This includes compressed, atomic, floating-point, `FENCE.I` and CSR instructions, and the all-zero word `0x00000000`. As a result, a program that runs into zero-filled memory traps instead of silently continuing.
+
+### Rules that are easy to get wrong in C++
+
+These come from the RISC-V spec but are common sources of simulator bugs:
+
+- **Division never traps.** Dividing by zero: `DIV` and `DIVU` return all ones (`0xFFFFFFFF`), and `REM`/`REMU` return the dividend. Signed overflow, `DIV(-2³¹, -1)`, returns `-2³¹`, and the matching `REM` returns 0. In C++, `x / 0` and `INT32_MIN / -1` are undefined behavior, so check for both cases before dividing.
+- **Shift amounts** use only the low 5 bits of `rs2`. For `SLLI`/`SRLI`/`SRAI`, an immediate with bit 5 set is illegal on RV32.
+- **`JALR`** clears bit 0 of the computed target. When `rd == rs1`, compute the target from the old `rs1` *before* writing `rd`.
+- **Sign extension:** all immediates are sign-extended. `LB`/`LH` sign-extend the loaded value; `LBU`/`LHU` zero-extend it.
+
+## A2. Memory and MMU
+
+| Property | Value |
+|---|---|
+| Physical RAM | 1 MiB (`0x00000`–`0xFFFFF`), byte-addressable, all zeros at power-on |
+| Page / frame size | 4 KiB (4096 bytes) |
+| Physical frames | 256 |
+| Virtual address | 32 bits: virtual page number = bits 31–12, offset = bits 11–0 |
+
+**Every CPU memory access goes through the MMU**: instruction fetch, load and store. The CPU never touches physical memory directly. The MMU translates addresses using the **current address space**, which the kernel selects (like RISC-V's `satp` register). Switching address spaces is part of switching processes.
+
+Each page mapping holds a frame number and these permission bits:
+
+| Bit | Meaning | Required for |
+|---|---|---|
+| V | Valid | Any access |
+| R | Readable | Loads |
+| W | Writable | Stores |
+| X | Executable | Instruction fetch |
+
+An access to an unmapped page, or one its permissions don't allow, raises the matching page fault (fetch, load or store; see A3).
+
+The page-table *format* (how mappings are stored, and whether page tables live in simulated RAM) is an open question for Milestone 3.
+
+## A3. Traps
+
+A **trap** stops the CPU and hands control to the kernel. An *exception* is caused by the current instruction. An *interrupt* comes from outside it; for now, the timer is the only source.
+
+Cause codes are the same as RISC-V's, so RISC-V documentation stays useful as a reference.
+
+| Cause | Name | Raised when | `tval` |
+|---|---|---|---|
+| 0 | Instruction address misaligned | Taken branch or jump to a target that isn't 4-byte aligned | Target address |
+| 2 | Illegal instruction | Encoding not listed in A1 | The instruction word |
+| 3 | Breakpoint | `EBREAK` | 0 |
+| 4 | Load address misaligned | Misaligned `LH`, `LHU` or `LW` | Address |
+| 6 | Store address misaligned | Misaligned `SH` or `SW` | Address |
+| 8 | Environment call | `ECALL` | 0 |
+| 12 | Instruction page fault | Fetch from a page that is unmapped or not X | Address |
+| 13 | Load page fault | Load from a page that is unmapped or not R | Address |
+| 15 | Store page fault | Store to a page that is unmapped or not W | Address |
+| Interrupt 5 | Timer interrupt | Clock has reached the timer deadline (A4) | 0 |
+
+On a trap, the CPU gives the kernel a **trap record**:
+
+- `cause`: a code from the table, plus a flag saying whether it is an interrupt
+- `pc`: the address of the instruction that trapped. For an interrupt, the instruction that was about to run.
+- `tval`: extra information, as listed in the table
+
+**Traps are precise.** A trapping instruction changes nothing: no register, no memory, and `pc` stays the same. This is guaranteed because an instruction makes at most one data access, and an aligned access never crosses a page boundary. The CPU can therefore check the fetch and the data access before it changes any state.
+
+**After a trap, the kernel decides how to resume:**
+
+| The kernel wants to… | Resume at |
+|---|---|
+| Retry the instruction (e.g. after mapping a missing page) | `pc` |
+| Continue after a system call | `pc + 4`. As in RISC-V, the trap's `pc` points at the `ECALL` itself. |
+| Run a different process | That process's saved `pc` |
+| Kill the process | Nothing to resume |
+
+Kernel code is C++ and always runs to completion. It is never interrupted, so the machine has no interrupt-enable flag.
+
+## A4. Clock and timer
+
+- The machine keeps a 64-bit **clock** that goes up by 1 for every instruction the CPU attempts, including one that ends in an exception. Kernel code takes zero simulated time.
+- The kernel sets a 64-bit **timer deadline** (like RISC-V's `mtimecmp`). Before each instruction, if `clock >= deadline`, the CPU raises a timer interrupt instead of running the instruction. Taking the interrupt does not advance the clock.
+- The interrupt keeps firing until the kernel moves the deadline forward, for example `deadline = clock + quantum`. The starting quantum is 1000.
+
+## A5. Machine state summary
+
+This is everything the hardware holds. A process's CPU context is the first row; it is what the kernel saves and restores on a context switch.
+
+| State | Size |
+|---|---|
+| `x0`–`x31`, `pc` | 33 × 32 bits |
+| Physical RAM | 1 MiB |
+| Current address space | Set by the kernel |
+| Clock, timer deadline | 64 bits each |
+
+---
+
+# Part B — Software conventions
+
+## B1. Process address space
+
+```
+0xFFFFFFFF ┌────────────────────────────┐
+           │ kernel-reserved            │  never mapped
+0x80000000 ├────────────────────────────┤  ← initial sp
+           │ stack ↓                    │  up to 1 MiB
+0x7FF00000 ├────────────────────────────┤
+           │                            │
+           │ unmapped                   │
+           │                            │
+           ├────────────────────────────┤  ← current break
+           │ heap ↑                     │  grows with sbrk
+           ├────────────────────────────┤  ← initial break
+           │ data + bss           RW    │
+           ├────────────────────────────┤
+           │ code + rodata        RX/R  │
+0x00010000 ├────────────────────────────┤
+           │ null guard                 │  never mapped
+0x00000000 └────────────────────────────┘
+                  (not to scale)
+```
+
+- **User addresses are below `0x80000000`.** The upper half is reserved, so any access to it faults.
+- **Null guard:** `0x00000000`–`0x0000FFFF` is never mapped, so a null-pointer access faults.
+- **Stack:** the initial `sp` is `0x80000000`, which meets the RISC-V ABI's 16-byte alignment rule. The stack region is `0x7FF00000`–`0x7FFFFFFF`, and the kernel may map its pages on demand.
+- **Heap:** the initial break is the end of the highest loaded segment, rounded up to 4 KiB. It moves with `sbrk` and cannot grow past `0x7FF00000`.
+- **New pages are always zero-filled**, so a process can never see another process's old data.
+
+## B2. Program format and loading
+
+User programs are **ELF32 executables** for RISC-V: little-endian, `EM_RISCV` (243), `ET_EXEC`, statically linked.
+
+The loader:
+
+1. Checks the ELF header: class, byte order, machine and type.
+2. For each `PT_LOAD` segment:
+   - requires it to lie within `[0x00010000, 0x7FF00000)`
+   - maps its pages with permissions taken from `p_flags` (R/W/X)
+   - copies `p_filesz` bytes from the file and zero-fills the rest up to `p_memsz` (this is `.bss`)
+
+   If two segments share a page, that page gets the union of their permissions.
+3. Sets the initial CPU state: `pc = e_entry`, `sp` (`x2`) `= 0x80000000`, all other registers 0.
+
+`argc`/`argv` are not defined yet (Milestone 5, with `exec`).
+
+## B3. System calls
+
+The register convention is the same as Linux on RISC-V:
+
+| Register | Purpose |
+|---|---|
+| `a7` (`x17`) | System call number |
+| `a0`–`a5` (`x10`–`x15`) | Arguments |
+| `a0` | Return value. A negative value is an error code (`-errno`). |
+
+The program executes `ECALL`. The kernel handles the call and resumes the program at `pc + 4`. The kernel changes no registers other than `a0`.
+
+The call numbers are our own, not Linux's, because we don't aim to run Linux binaries.
+
+| # | Name | Arguments | Returns | Milestone |
+|---|---|---|---|---|
+| 1 | `exit` | `a0` = status | Does not return | 2 |
+| 2 | `write` | `a0` = fd, `a1` = buffer address, `a2` = length | Bytes written | 2 |
+| 3 | `sbrk` | `a0` = bytes to grow (may be negative) | Old break | 3 |
+| 4 | `getpid` | — | Process ID | 4 |
+| 5 | `yield` | — | 0 | 4 |
+| 6–8 | `fork`, `exec`, `wait` | To be defined | | 5 |
+
+For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
+
+**Error codes** use Linux's values so they are familiar:
+
+| Name | Value | Meaning |
+|---|---|---|
+| `EBADF` | 9 | Bad file descriptor |
+| `ENOMEM` | 12 | Out of memory |
+| `EFAULT` | 14 | Bad pointer passed to the kernel |
+| `EINVAL` | 22 | Invalid argument |
+| `ENOSYS` | 38 | Unknown system call number |
+
+**Rules:**
+
+- An unknown system call number returns `-ENOSYS`. The process is not killed.
+- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (for example a stack page not yet allocated), the kernel maps the page and continues. The `ECALL` is never re-executed, so its side effects can't happen twice.
+
+---
+
+## Milestone notes
+
+**Milestones 1–2 (before the MMU):** addresses are physical (virtual = physical), and permission bits are not checked. Programs still load at `0x00010000`, but the initial `sp` is the top of RAM, `0x00100000`, because address `0x80000000` doesn't exist yet. An access outside RAM raises the matching page fault.
+
+**Milestone 1 (no kernel yet):** any trap stops the simulation and prints the trap record. `ECALL` stops the simulation and prints `a0`, which gives test programs a way to report a result.
+
+## Not in scope (for now)
+
+- Multiple CPUs, caches, TLB
+- Devices, disks, and interrupts other than the timer
+- Floating-point, atomic, compressed and CSR instructions
+- Hardware support for misaligned access
+
+## Open questions
+
+| Question | Decide by |
+|---|---|
+| Page-table format. Do page tables live in simulated RAM? | Milestone 3 |
+| What happens when physical RAM runs out: kill the process, or swap? | Milestone 3 |
+| Layout of `argc`/`argv` on the initial stack | Milestone 5 |
+| Exact semantics of `fork`, `exec` and `wait` | Milestone 5 |
+| Reading input (`read`, stdin) | Later |
+
+## Appendix: Toolchain
+
+Apple's clang has no RISC-V backend, so use Homebrew LLVM (`brew install llvm lld`):
+
+```sh
+/opt/homebrew/opt/llvm/bin/clang --target=riscv32 -march=rv32im -mabi=ilp32 \
+    -O1 -ffreestanding -nostdlib -c prog.c -o prog.o
+```
+
+`-march=rv32im` is required. Without it, clang's default target includes compressed and atomic instructions, which this CPU rejects as illegal. The link command (via `ld.lld`) will be added in Milestone 1.
