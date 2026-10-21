@@ -32,6 +32,7 @@ add_library(ossim_core
   src/cpu/cpu.cpp
   src/loader/elf.cpp
   src/machine/machine.cpp
+  src/kernel/kernel.cpp
 )
 target_include_directories(ossim_core PUBLIC src)
 target_link_libraries(ossim_core PUBLIC ossim_options)
@@ -52,6 +53,9 @@ add_executable(ossim_tests
   tests/cpu_load_store_test.cpp
   tests/loader_test.cpp
   tests/machine_test.cpp
+  tests/kernel_test.cpp
 )
 target_link_libraries(ossim_tests PRIVATE ossim_core)
 add_test(NAME ossim_tests COMMAND ossim_tests)
+# A bug that loops forever should fail the test run, not hang it.
+set_tests_properties(ossim_tests PROPERTIES TIMEOUT 60)

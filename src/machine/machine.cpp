@@ -16,7 +16,6 @@ std::optional<std::string> Machine::load(std::span<const uint8_t> bytes) {
 }
 
 std::optional<cpu::Trap> Machine::run(std::size_t max_step) {
-
     while (max_step--) {
         ++steps_;
         std::optional<cpu::Trap> step_result = cpu_.step();

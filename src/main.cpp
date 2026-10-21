@@ -12,6 +12,7 @@
 
 #include "isa/isa.hpp"
 #include "machine/machine.hpp"
+#include "kernel/kernel.hpp"
 
 std::optional<std::vector<uint8_t> > read_file(const char* file) {
     int fd = open(file, O_RDONLY);
@@ -40,30 +41,39 @@ void log_and_exit(const std::string& message) {
     exit(-1);
 }
 
-void run(int argc, char** argv) {
+int run(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr, "invalid number of arguments\n", argv[0]);
-        return;
+        return 1;
     }
     std::optional<std::vector<uint8_t>> readed = read_file(argv[2]);
     if (!readed) {
         log_and_exit("could not read");
     }
     machine::Machine machine;
+    kernel::Kernel kernel(machine);
     std::optional<std::string> load_instructions_error = machine.load(*readed);
     if (load_instructions_error) {
         log_and_exit(*load_instructions_error);
     }
-    std::optional<cpu::Trap> trapped = machine.run(1e8);
-    if (trapped) {
-        std::cerr << *trapped;
-        return;
+    using kernel::Exited, kernel::Killed, kernel::StepLimit;
+    std::variant<Exited, Killed, StepLimit> run_result = kernel.run(1e8);
+
+    if (const auto* exited = std::get_if<Exited>(&run_result)) {
+        std::cerr << "program exited with status " << exited->exit_status << "\n";
+        return exited->exit_status;
     }
-    std::cerr << machine.cpu().reg(static_cast<uint8_t>(isa::reg::a0));
+    if (const auto* killed = std::get_if<Killed>(&run_result)) {
+        std::cerr << "program killed by a trap:\n" << killed->trap;
+        return 1;
+    }
+    std::cerr << "program did not finish within " << machine.steps() << " instructions\n";
+    return 1;
 }
 
 int main(int argc, char** argv) {
     if (argc >= 2 && static_cast<std::string_view>(argv[1]) == "run") {
-        run(argc, argv);
+        return run(argc, argv);
     }
+    
 }

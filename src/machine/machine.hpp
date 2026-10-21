@@ -15,6 +15,10 @@ public :
         return cpu_;
     }
 
+    cpu::Cpu& cpu() {
+        return cpu_;
+    }
+
     uint64_t steps() const {
         return steps_;
     }
