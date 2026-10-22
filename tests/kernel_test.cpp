@@ -1,6 +1,7 @@
 // Kernel: runs a program, handles its traps and system calls (spec A3, B3).
 #include <cstdint>
 #include <initializer_list>
+#include <sstream>
 #include <variant>
 
 #include "cpu_helpers.hpp"   // prints Cause in failure messages
@@ -28,7 +29,8 @@ const isa::Instruction kEcall = {ECALL};
 Result run_program(machine::Machine& m, std::initializer_list<isa::Instruction> program,
                    uint64_t max_steps = 1000) {
     CHECK(!m.load(elf_builder::program_elf(program)));
-    kernel::Kernel k(m);
+    std::ostringstream out, err;   // these tests don't look at output
+    kernel::Kernel k(m, out, err);
     return k.run(max_steps);
 }
 

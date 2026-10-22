@@ -7,6 +7,7 @@
 
 #include "cpu_helpers.hpp"   // prints Cause in failure messages
 #include "elf_builder.hpp"
+#include "loader/elf.hpp"
 #include "machine/machine.hpp"
 #include "test.hpp"
 
@@ -27,7 +28,7 @@ TEST(machine_load_sets_pc_sp_and_resets_steps) {
     machine::Machine m;
     CHECK(!m.load(make_elf(kEntry + 8, {{kEntry, code({kLoopForever, kLoopForever, kLoopForever})}})));
     CHECK_EQ(m.cpu().pc, kEntry + 8);                    // pc = ELF entry point
-    CHECK_EQ(m.cpu().reg(sp), mem::Ram::kRamSize);       // sp = top of RAM (milestone notes)
+    CHECK_EQ(m.cpu().reg(sp), loader::kStackTop);       // sp = top of the stack (spec B1)
     CHECK_EQ(m.cpu().reg(a0), 0);                        // other registers start at 0
     CHECK_EQ(m.steps(), 0);
 }
@@ -128,4 +129,32 @@ TEST(machine_load_again_resets_steps) {
     m.run(5);
     CHECK(!m.load(program_elf({kLoopForever})));
     CHECK_EQ(m.steps(), 0);
+}
+
+TEST(machine_runs_program_at_virtual_address_beyond_ram) {
+    // 0x40000000 doesn't exist in 1 MiB of RAM: this only works with translation on.
+    machine::Machine m;
+    CHECK(!m.load(make_elf(0x40000000, {{0x40000000, code({
+        {ADDI, a0, zero, 0, 5},
+        {SW, 0, sp, a0, -4},        // the stack works too
+        {LW, a1, sp, 0, -4},
+        {ECALL},
+    })}})));
+    const auto trap = m.run(1000);
+    CHECK(trap.has_value());
+    CHECK_EQ(trap->cause, cpu::Cause::ecall);
+    CHECK_EQ(trap->pc, 0x4000000c);
+    CHECK_EQ(m.cpu().reg(a1), 5);
+}
+
+TEST(machine_code_is_not_writable) {
+    // Code pages are R+X: a program that stores into its own code is stopped.
+    machine::Machine m;
+    CHECK(!m.load(program_elf({
+        {AUIPC, a1, 0, 0, 0},       // a1 = address of this instruction
+        {SW, 0, a1, zero, 0},
+    })));
+    const auto trap = m.run(1000);
+    CHECK(trap.has_value());
+    CHECK_EQ(trap->cause, cpu::Cause::store_page_fault);
 }

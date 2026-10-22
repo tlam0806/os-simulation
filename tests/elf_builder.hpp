@@ -23,12 +23,14 @@ inline void put32(std::vector<uint8_t>& f, size_t at, uint32_t v) {
 
 inline constexpr uint32_t PT_LOAD = 1;
 inline constexpr uint32_t PT_GNU_STACK = 0x6474e551;   // present in real clang/lld output
+inline constexpr uint32_t PF_X = 1, PF_W = 2, PF_R = 4;  // p_flags bits
 
 struct Segment {
     uint32_t vaddr;
     std::vector<uint8_t> data;   // the bytes stored in the file (p_filesz = data.size())
     uint32_t memsz = 0;          // 0 means "same as data.size()"
     uint32_t type = PT_LOAD;
+    uint32_t flags = PF_R | PF_X;
 };
 
 // Field offsets in the ELF header and in a program header.
@@ -62,7 +64,7 @@ inline std::vector<uint8_t> make_elf(uint32_t entry, const std::vector<Segment>&
         put32(f, ph + 12, s.vaddr);  // p_paddr
         put32(f, ph + P_FILESZ, static_cast<uint32_t>(s.data.size()));
         put32(f, ph + P_MEMSZ, s.memsz ? s.memsz : static_cast<uint32_t>(s.data.size()));
-        put32(f, ph + 24, 5);        // p_flags = R+X
+        put32(f, ph + 24, s.flags);
         put32(f, ph + 28, 0x1000);   // p_align
         for (size_t j = 0; j < s.data.size(); j++) f[data_at + j] = s.data[j];
         data_at += s.data.size();
@@ -72,6 +74,15 @@ inline std::vector<uint8_t> make_elf(uint32_t entry, const std::vector<Segment>&
 
 // Encodes instructions into little-endian bytes, ready to be a segment's data.
 inline std::vector<uint8_t> code(std::initializer_list<isa::Instruction> program) {
+    std::vector<uint8_t> bytes;
+    for (const isa::Instruction& inst : program) {
+        const uint32_t word = isa::encode(inst);
+        for (int i = 0; i < 4; i++) bytes.push_back((word >> (8 * i)) & 0xff);
+    }
+    return bytes;
+}
+
+inline std::vector<uint8_t> code(const std::vector<isa::Instruction>& program) {
     std::vector<uint8_t> bytes;
     for (const isa::Instruction& inst : program) {
         const uint32_t word = isa::encode(inst);

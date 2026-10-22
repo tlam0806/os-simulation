@@ -51,7 +51,7 @@ int run(int argc, char** argv) {
         log_and_exit("could not read");
     }
     machine::Machine machine;
-    kernel::Kernel kernel(machine);
+    kernel::Kernel kernel(machine, std::cout, std::cerr);
     std::optional<std::string> load_instructions_error = machine.load(*readed);
     if (load_instructions_error) {
         log_and_exit(*load_instructions_error);

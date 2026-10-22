@@ -85,7 +85,13 @@ Each page mapping holds a frame number and these permission bits:
 
 An access to an unmapped page, or one its permissions don't allow, raises the matching page fault (fetch, load or store; see A3).
 
-The page-table *format* (how mappings are stored, and whether page tables live in simulated RAM) is an open question for Milestone 3.
+**Page tables live in host memory, not in simulated RAM** (decided in Milestone 3). Each address space is a C++ table from virtual page number to mapping, owned by the kernel. Simulated RAM holds only program code and data, so all 256 frames are available to programs. Real RISC-V (Sv32) stores page tables in RAM and walks them in hardware; we skip that, because our kernel is C++ and doesn't need to.
+
+Translation of an address `vaddr` for an access (fetch, load or store):
+
+1. Look up the virtual page number `vaddr >> 12`. No entry → page fault.
+2. Check the permission bit for the access: X for fetch, R for load, W for store. Not set → page fault.
+3. The physical address is `frame * 4096 + (vaddr & 0xFFF)`.
 
 ## A3. Traps
 
@@ -171,7 +177,7 @@ This is everything the hardware holds. A process's CPU context is the first row;
 
 - **User addresses are below `0x80000000`.** The upper half is reserved, so any access to it faults.
 - **Null guard:** `0x00000000`–`0x0000FFFF` is never mapped, so a null-pointer access faults.
-- **Stack:** the initial `sp` is `0x80000000`, which meets the RISC-V ABI's 16-byte alignment rule. The stack region is `0x7FF00000`–`0x7FFFFFFF`, and the kernel may map its pages on demand.
+- **Stack:** the initial `sp` is `0x80000000`, which meets the RISC-V ABI's 16-byte alignment rule. The stack region is `0x7FF00000`–`0x7FFFFFFF`. The loader maps the top 16 pages (64 KiB) read+write; the kernel may map more on demand later.
 - **Heap:** the initial break is the end of the highest loaded segment, rounded up to 4 KiB. It moves with `sbrk` and cannot grow past `0x7FF00000`.
 - **New pages are always zero-filled**, so a process can never see another process's old data.
 
@@ -184,7 +190,7 @@ The loader:
 1. Checks the ELF header: class, byte order, machine and type.
 2. For each `PT_LOAD` segment:
    - requires it to lie within `[0x00010000, 0x7FF00000)`
-   - maps its pages with permissions taken from `p_flags` (R/W/X)
+   - gives each of its pages a free frame, zero-filled, mapped with permissions taken from `p_flags` (R/W/X)
    - copies `p_filesz` bytes from the file and zero-fills the rest up to `p_memsz` (this is `.bss`)
 
    If two segments share a page, that page gets the union of their permissions.
@@ -236,7 +242,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 
 ## Milestone notes
 
-**Milestones 1–2 (before the MMU):** addresses are physical (virtual = physical), and permission bits are not checked. Programs still load at `0x00010000`, but the initial `sp` is the top of RAM, `0x00100000`, because address `0x80000000` doesn't exist yet. An access outside RAM raises the matching page fault.
+**Milestones 1–2 (before the MMU, no longer how programs run):** addresses are physical (virtual = physical), and permission bits are not checked. Programs still load at `0x00010000`, but the initial `sp` is the top of RAM, `0x00100000`, because address `0x80000000` doesn't exist yet. An access outside RAM raises the matching page fault.
 
 **Milestone 1 (no kernel yet):** any trap stops the simulation and prints the trap record. `ECALL` stops the simulation and prints `a0`, which gives test programs a way to report a result.
 
@@ -251,7 +257,6 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 
 | Question | Decide by |
 |---|---|
-| Page-table format. Do page tables live in simulated RAM? | Milestone 3 |
 | What happens when physical RAM runs out: kill the process, or swap? | Milestone 3 |
 | Layout of `argc`/`argv` on the initial stack | Milestone 5 |
 | Exact semantics of `fork`, `exec` and `wait` | Milestone 5 |

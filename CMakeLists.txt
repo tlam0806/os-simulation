@@ -33,6 +33,8 @@ add_library(ossim_core
   src/loader/elf.cpp
   src/machine/machine.cpp
   src/kernel/kernel.cpp
+  src/mmu/page_table.cpp
+  src/mmu/frame_allocator.cpp
 )
 target_include_directories(ossim_core PUBLIC src)
 target_link_libraries(ossim_core PUBLIC ossim_options)
@@ -54,6 +56,11 @@ add_executable(ossim_tests
   tests/loader_test.cpp
   tests/machine_test.cpp
   tests/kernel_test.cpp
+  tests/kernel_write_test.cpp
+  tests/page_table_test.cpp
+  tests/cpu_mmu_test.cpp
+  tests/frame_allocator_test.cpp
+  tests/kernel_sbrk_test.cpp
 )
 target_link_libraries(ossim_tests PRIVATE ossim_core)
 add_test(NAME ossim_tests COMMAND ossim_tests)

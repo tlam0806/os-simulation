@@ -133,8 +133,9 @@ std::optional<Trap> Cpu::step() noexcept {
         const uint8_t size = (decoded.op == LB || decoded.op == LBU) ? 1
                            : (decoded.op == LH || decoded.op == LHU) ? 2 : 4;
         if (addr % size != 0) return trap(Cause::load_address_misaligned, addr);
-        const auto value = ram.read(addr, size);
-        if (!value) return trap(Cause::load_page_fault, addr);
+        const auto paddr = to_physical(addr, mmu::Access::load);
+        const auto value = paddr ? ram.read(*paddr, size) : std::nullopt;
+        if (!value) return trap(Cause::load_page_fault, addr);   // tval stays virtual
         uint32_t v = *value;
         if (decoded.op == LB) v = static_cast<uint32_t>(int32_t{static_cast<int8_t>(v)});
         if (decoded.op == LH) v = static_cast<uint32_t>(int32_t{static_cast<int16_t>(v)});
@@ -146,7 +147,8 @@ std::optional<Trap> Cpu::step() noexcept {
     case SB: case SH: case SW: {
         const uint8_t size = decoded.op == SB ? 1 : decoded.op == SH ? 2 : 4;
         if (addr % size != 0) return trap(Cause::store_address_misaligned, addr);
-        if (!ram.write(addr, size, rs2)) return trap(Cause::store_page_fault, addr);
+        const auto paddr = to_physical(addr, mmu::Access::store);
+        if (!paddr || !ram.write(*paddr, size, rs2)) return trap(Cause::store_page_fault, addr);
         break;
     }
 
@@ -168,7 +170,8 @@ std::variant<uint32_t, Trap> Cpu::fetch() noexcept {
             pc
         };
     }
-    std::optional<uint32_t> result = ram.read(pc, 4);
+    const std::optional<uint32_t> paddr = to_physical(pc, mmu::Access::fetch);
+    std::optional<uint32_t> result = paddr ? ram.read(*paddr, 4) : std::nullopt;
     if (result) {
         return result.value();
     } else {
@@ -178,6 +181,17 @@ std::variant<uint32_t, Trap> Cpu::fetch() noexcept {
             pc
         };
     }
+}
+
+void Cpu::set_page_table(const mmu::PageTable* ptr) noexcept {
+    page_table = ptr;
+}
+
+std::optional<uint32_t> Cpu::to_physical(uint32_t vaddr, mmu::Access access) const noexcept {
+    if (page_table == nullptr) {
+        return vaddr;
+    }
+    return translate(*page_table, vaddr, access);
 }
 
 }  // namespace cpu

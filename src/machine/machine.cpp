@@ -4,14 +4,16 @@
 namespace machine {
 
 std::optional<std::string> Machine::load(std::span<const uint8_t> bytes) {
-    std::variant<loader::Program, std::string> load_result = loader::load_elf(bytes, ram_);
+    std::variant<loader::Program, std::string> load_result = loader::load_elf(bytes, ram_, frame_allocator_, page_table_);
     if (std::holds_alternative<std::string>(load_result)) {
         return std::get<std::string>(load_result);
     }
     loader::Program program = std::get<loader::Program>(load_result);
+    cpu_.set_page_table(&page_table_);
     cpu_.pc = program.entry;
-    cpu_.set_reg(static_cast<uint8_t>(isa::reg::sp), mem::Ram::kRamSize);
+    cpu_.set_reg(isa::reg::sp, loader::kStackTop);
     steps_ = 0;
+    initial_break_ = current_break_ = program.initial_break;
     return std::nullopt;
 }
 
