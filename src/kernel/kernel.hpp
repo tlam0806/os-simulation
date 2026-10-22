@@ -85,7 +85,7 @@ private :
     
     std::variant<Exited, Killed, Continue, Switch> handle_trap(const cpu::Trap& trap);
     
-    std::variant<Exited, Continue> handle_syscall();
+    std::variant<Exited, Continue, Switch> handle_syscall();
 
     std::optional<std::vector<uint8_t>> read_memory_on_ram(uint32_t addr, uint32_t bytes_count) const; 
 
@@ -96,6 +96,10 @@ private :
     Continue sys_sbrk(); // 3
 
     Continue sys_other(); // other
+
+    Continue sys_getpid();
+
+    Switch sys_yield();
 
     mem::Ram& ram() {
         return machine_.ram();
