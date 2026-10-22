@@ -45,23 +45,6 @@ public :
         return steps_;
     }
 
-    uint32_t initial_break() {
-        return initial_break_;
-    }
-
-    uint32_t current_break() {
-        return current_break_;
-    }
-
-    void set_break(uint32_t new_break) {
-        current_break_ = new_break;
-        if (initial_break_ > current_break_) {
-            std::cerr << "current break is less than initial break\n";
-            std::abort();
-        }
-    }
-
-
 private :
     static constexpr uint64_t kTimerOff = UINT64_MAX;
     mmu::FrameAllocator frame_allocator_{};
@@ -69,8 +52,6 @@ private :
     mem::Ram ram_{};
     cpu::Cpu cpu_{ram_};
     uint64_t steps_{};
-    uint32_t initial_break_{};
-    uint32_t current_break_{};
     uint64_t deadline_ = kTimerOff;
 };
 

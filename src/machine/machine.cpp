@@ -13,7 +13,6 @@ std::optional<std::string> Machine::load(std::span<const uint8_t> bytes) {
     cpu_.pc = program.entry;
     cpu_.set_reg(isa::reg::sp, loader::kStackTop);
     steps_ = 0;
-    initial_break_ = current_break_ = program.initial_break;
     return std::nullopt;
 }
 

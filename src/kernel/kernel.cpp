@@ -33,29 +33,6 @@ static inline std::variant<ResultTypes...> convert_variant(const std::variant<Ar
     return convert_helper<0, ResultTypes...>(var);
 }
 
-std::variant<Exited, Killed, StepLimit> Kernel::run(uint64_t max_steps) {
-    uint64_t starting_step = machine_.steps();
-    uint64_t maximum_step = starting_step + max_steps;
-    while (true) {
-        uint64_t current_step = machine_.steps();
-        std::optional<cpu::Trap> run_result = machine_.run(maximum_step - current_step);
-        if (run_result) {
-            cpu::Trap trap = *run_result;
-            std::variant<Exited, Killed, Continue, Switch> handle_result = handle_trap(trap);
-            if (std::holds_alternative<Continue>(handle_result)) {
-                machine_.cpu().pc += 4;
-                continue;
-            }
-            // This single-program path never sets the timer, so Switch can't happen here.
-            assert(!std::holds_alternative<Switch>(handle_result));
-            return convert_variant<Exited, Killed, StepLimit>(handle_result);
-        } else {
-            return StepLimit{};
-        }
-    }
-    return StepLimit{};
-}
-
 std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Trap& trap) {
     switch (trap.cause) {
         case cpu::Cause::ecall :

@@ -41,7 +41,6 @@ public :
         err_{err}
     {}
     
-    std::variant<Exited, Killed, StepLimit> run(uint64_t max_steps);
 
     // Creates a new process from an ELF file (spec B2): its own page table,
     // built by the loader with frames from the machine's frame allocator, and
