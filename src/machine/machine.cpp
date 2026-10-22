@@ -18,7 +18,11 @@ std::optional<std::string> Machine::load(std::span<const uint8_t> bytes) {
 }
 
 std::optional<cpu::Trap> Machine::run(std::size_t max_step) {
-    while (max_step--) {
+    while (max_step > 0) {
+        if (steps_ >= deadline_) {
+            return cpu::Trap{cpu::Cause::timer_interrupt, cpu().pc, 0};
+        }
+        --max_step;
         ++steps_;
         std::optional<cpu::Trap> step_result = cpu_.step();
         if (step_result) {
@@ -26,6 +30,14 @@ std::optional<cpu::Trap> Machine::run(std::size_t max_step) {
         }
     }
     return std::nullopt;
+}
+
+void Machine::set_timer(uint64_t deadline) {
+    deadline_ = deadline;
+}
+
+void Machine::clear_timer() {
+    deadline_ = kTimerOff;
 }
 
 }
