@@ -194,4 +194,16 @@ std::optional<uint32_t> Cpu::to_physical(uint32_t vaddr, mmu::Access access) con
     return translate(*page_table, vaddr, access);
 }
 
+Context Cpu::context() const noexcept { 
+    assert(registers[0] == 0);
+    Context saved{registers, pc};
+    return saved;
+}
+
+void Cpu::set_context(const Context& context) noexcept {
+    assert(context.regs[0] == 0);
+    registers = context.regs;
+    pc = context.pc;
+}
+
 }  // namespace cpu

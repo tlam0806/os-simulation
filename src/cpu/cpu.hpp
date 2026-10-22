@@ -8,8 +8,13 @@
 #include "cpu/trap.hpp"
 #include "isa/isa.hpp"
 #include "mmu/page_table.hpp"
+#include "cpu/context.hpp"
 
 namespace cpu {
+
+// Everything a program needs to continue later exactly where it stopped:
+// its registers and pc (spec A5). The kernel saves one per process.
+
 
 class Cpu {
 public : 
@@ -33,6 +38,12 @@ public :
     }
 
     std::optional<Trap> step() noexcept;
+
+    // Save / restore all registers and pc at once, for context switches.
+    // set_context requires regs[0] == 0 (asserted). The page table is not part of
+    // the context; the kernel switches it separately with set_page_table.
+    Context context() const noexcept;
+    void set_context(const Context& context) noexcept;
 
     // Selects the address space that translates every fetch, load and store
     // (like RISC-V's satp register; spec A2). The kernel switches it when it
