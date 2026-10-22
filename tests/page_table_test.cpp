@@ -1,6 +1,7 @@
 // Page table and translation (spec A2).
 #include <cstdint>
 #include <optional>
+#include <vector>
 #include <ostream>
 
 #include "mmu/page_table.hpp"
@@ -160,4 +161,20 @@ TEST(page_table_tables_are_independent) {
     b.map(0x10, rwx(2));
     CHECK_EQ(phys(a, 0x10000, Access::load), 0x1000);
     CHECK_EQ(phys(b, 0x10000, Access::load), 0x2000);
+}
+
+TEST(page_table_mapped_pages) {
+    // Used by the kernel to free every frame of a process that ends.
+    mmu::PageTable t;
+    CHECK(t.mapped_pages().empty());
+    t.map(0x7ffff, rwx(1));
+    t.map(0x10, rwx(2));
+    t.map(0x11, rwx(3));
+    t.unmap(0x11);
+    const std::vector<uint32_t> pages = t.mapped_pages();
+    CHECK_EQ(pages.size(), 2);
+    if (pages.size() == 2) {
+        CHECK_EQ(pages[0], 0x10);      // in increasing order
+        CHECK_EQ(pages[1], 0x7ffff);
+    }
 }

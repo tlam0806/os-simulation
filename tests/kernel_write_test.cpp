@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "cpu_helpers.hpp"
+#include "kernel_helpers.hpp"
 #include "elf_builder.hpp"
 #include "kernel/kernel.hpp"
 #include "machine/machine.hpp"
@@ -36,11 +37,8 @@ Output run(std::initializer_list<isa::Instruction> program, const std::string& d
     using namespace elf_builder;
     std::vector<Segment> segments = {{kCode, code(program)}};
     if (!data.empty()) segments.push_back({kData, std::vector<uint8_t>(data.begin(), data.end())});
-    CHECK(!m.load(make_elf(kCode, segments)));
-
     std::ostringstream out, err;
-    kernel::Kernel k(m, out, err);
-    const auto result = k.run(1000);
+    const Result result = run_process(m, make_elf(kCode, segments), 1000, out, err);
     const auto* exited = std::get_if<kernel::Exited>(&result);
     CHECK(exited != nullptr);
     return {out.str(), err.str(), exited ? exited->exit_status : -12345};
@@ -152,16 +150,14 @@ TEST(write_buffer_partly_unmapped_returns_efault) {
     // The first 2 bytes are readable, the last 2 are not: print nothing at all.
     machine::Machine m;
     std::ostringstream out, err;
-    CHECK(!m.load(elf_builder::make_elf(kCode, {
+    const Result r = run_process(m, elf_builder::make_elf(kCode, {
         {kCode, elf_builder::code({
             {ADDI, a0, zero, 0, kStdout}, {LUI, a1, 0, 0, 0x12000}, {ADDI, a1, a1, 0, -2},
             {ADDI, a2, zero, 0, 4}, kSetWrite, kEcall,
             kSetExit, kEcall,
         })},
         {0x11ffe, {'h', 'i'}, 0, elf_builder::PT_LOAD, elf_builder::PF_R},
-    })));
-    kernel::Kernel k(m, out, err);
-    const auto r = k.run(1000);
+    }), 1000, out, err);
     CHECK_EQ(out.str(), std::string(""));
     CHECK(std::holds_alternative<kernel::Exited>(r));
     if (const auto* e = std::get_if<kernel::Exited>(&r)) CHECK_EQ(e->exit_status, -kEfault);
@@ -175,7 +171,7 @@ TEST(write_buffer_across_pages_in_unrelated_frames) {
     // frame would print the wrong bytes.
     machine::Machine m;
     std::ostringstream out, err;
-    CHECK(!m.load(elf_builder::make_elf(kCode, {
+    const Result r = run_process(m, elf_builder::make_elf(kCode, {
         {kCode, elf_builder::code({
             {ADDI, a0, zero, 0, kStdout}, {LUI, a1, 0, 0, 0x12000}, {ADDI, a1, a1, 0, -2},
             {ADDI, a2, zero, 0, 5}, kSetWrite, kEcall,
@@ -183,9 +179,7 @@ TEST(write_buffer_across_pages_in_unrelated_frames) {
         })},
         {0x12100, {'x'}, 0, elf_builder::PT_LOAD, elf_builder::PF_R},   // maps page 0x12 first
         {0x11ffe, {'h', 'e', 'l', 'l', 'o'}, 0, elf_builder::PT_LOAD, elf_builder::PF_R},
-    })));
-    kernel::Kernel k(m, out, err);
-    const auto r = k.run(1000);
+    }), 1000, out, err);
     CHECK_EQ(out.str(), std::string("hello"));
     if (const auto* e = std::get_if<kernel::Exited>(&r)) CHECK_EQ(e->exit_status, 5);
 }
@@ -194,15 +188,13 @@ TEST(write_buffer_must_be_readable) {
     // Execute-only memory can't be read, not even by the kernel on the program's behalf.
     machine::Machine m;
     std::ostringstream out, err;
-    CHECK(!m.load(elf_builder::make_elf(kCode, {
+    const Result r = run_process(m, elf_builder::make_elf(kCode, {
         {kCode, elf_builder::code({
             {ADDI, a0, zero, 0, kStdout}, kBufAtData, {ADDI, a2, zero, 0, 2}, kSetWrite, kEcall,
             kSetExit, kEcall,
         })},
         {kData, {'h', 'i'}, 0, elf_builder::PT_LOAD, elf_builder::PF_X},
-    })));
-    kernel::Kernel k(m, out, err);
-    const auto r = k.run(1000);
+    }), 1000, out, err);
     CHECK_EQ(out.str(), std::string(""));
     if (const auto* e = std::get_if<kernel::Exited>(&r)) CHECK_EQ(e->exit_status, -kEfault);
 }

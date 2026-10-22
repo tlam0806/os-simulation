@@ -5,6 +5,7 @@
 #include <variant>
 
 #include "cpu_helpers.hpp"   // prints Cause in failure messages
+#include "kernel_helpers.hpp"
 #include "elf_builder.hpp"
 #include "kernel/kernel.hpp"
 #include "machine/machine.hpp"
@@ -14,8 +15,6 @@ using namespace isa::reg;
 using enum isa::Op;
 
 namespace {
-
-using Result = std::variant<kernel::Exited, kernel::Killed, kernel::StepLimit>;
 
 constexpr uint32_t kEntry = 0x10000;   // program_elf() puts code here
 constexpr int32_t SYS_EXIT = 1;        // spec B3
@@ -28,10 +27,8 @@ const isa::Instruction kEcall = {ECALL};
 
 Result run_program(machine::Machine& m, std::initializer_list<isa::Instruction> program,
                    uint64_t max_steps = 1000) {
-    CHECK(!m.load(elf_builder::program_elf(program)));
     std::ostringstream out, err;   // these tests don't look at output
-    kernel::Kernel k(m, out, err);
-    return k.run(max_steps);
+    return run_process(m, elf_builder::program_elf(program), max_steps, out, err);
 }
 
 // The exit status, or a value no test uses if the program didn't exit.

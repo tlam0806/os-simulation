@@ -13,7 +13,9 @@
 #include <variant>
 #include <vector>
 
+#include "asm.hpp"
 #include "cpu_helpers.hpp"
+#include "kernel_helpers.hpp"
 #include "elf_builder.hpp"
 #include "kernel/kernel.hpp"
 #include "machine/machine.hpp"
@@ -25,43 +27,21 @@ using enum isa::Op;
 
 namespace {
 
-constexpr int32_t SYS_EXIT = 1, SYS_SBRK = 3;
 constexpr int32_t kEnomem = 12, kEinval = 22;   // not ENOMEM/EINVAL: those are macros
 constexpr uint32_t kInitialBreak = 0x11000;     // code at 0x10000 is under one page
 
-// A tiny assembler: builds instruction lists, with branch targets patched later.
-struct Asm {
-    std::vector<isa::Instruction> code;
-
-    size_t here() const { return code.size(); }
-    void emit(isa::Instruction i) { code.push_back(i); }
-
-    // rd = value, for any 32-bit value (lui + addi, like the "li" pseudo-instruction).
-    void li(uint8_t rd, int32_t value) {
-        const int32_t hi = static_cast<int32_t>((static_cast<uint32_t>(value) + 0x800) & 0xfffff000);
-        const int32_t lo = static_cast<int32_t>(static_cast<uint32_t>(value) - static_cast<uint32_t>(hi));
-        if (hi == 0) { emit({ADDI, rd, zero, 0, lo}); return; }
-        emit({LUI, rd, 0, 0, hi});
-        if (lo != 0) emit({ADDI, rd, rd, 0, lo});
-    }
-
-    void sbrk(int32_t increment) { li(a0, increment); li(a7, SYS_SBRK); emit({ECALL}); }
-    void exit_with_a0() { li(a7, SYS_EXIT); emit({ECALL}); }
-
-    // Emits a branch whose target is filled in by patch() once it's known.
-    size_t branch(isa::Op op, uint8_t rs1, uint8_t rs2) { emit({op, 0, rs1, rs2, 0}); return here() - 1; }
-    void patch(size_t at, size_t target) {
-        code[at].imm = static_cast<int32_t>((static_cast<int64_t>(target) - static_cast<int64_t>(at)) * 4);
-    }
-};
-
-using Result = std::variant<kernel::Exited, kernel::Killed, kernel::StepLimit>;
-
 Result run(machine::Machine& m, const Asm& a) {
-    CHECK(!m.load(elf_builder::make_elf(0x10000, {{0x10000, elf_builder::code(a.code)}})));
     std::ostringstream out, err;
-    kernel::Kernel k(m, out, err);
-    return k.run(100000);
+    return run_process(m, elf_builder::make_elf(0x10000, {{0x10000, elf_builder::code(a.code)}}), 100000, out, err);
+}
+
+// The program checks a register itself: if reg != value, it exits with status 1.
+// (After a process ends, its registers are gone, so the test can't look at them.)
+void expect_reg(Asm& a, uint8_t reg, int32_t value) {
+    a.li(t2, value);
+    const size_t ok = a.branch(BEQ, reg, t2);
+    a.exit_with(1);
+    a.patch(ok, a.here());
 }
 
 int32_t exit_status(const Result& r) {
@@ -176,12 +156,12 @@ TEST(sbrk_shrink_returns_old_break_and_unmaps) {
     a.emit({ADDI, s0, a0, 0, 0});    // s0 = start of the heap
     a.sbrk(-8192);                   // a0 = old break = s0 + 8192
     a.emit({SUB, s1, a0, s0, 0});    // s1 = 8192
+    expect_reg(a, s1, 8192);
     a.emit({LW, t0, s0, 0, 0});      // heap is gone: page fault
     a.exit_with_a0();
     const cpu::Trap t = killed_by(run(m, a));
     CHECK_EQ(t.cause, cpu::Cause::load_page_fault);
     CHECK_EQ(t.tval, kInitialBreak);
-    CHECK_EQ(m.cpu().reg(s1), 8192);
 }
 
 TEST(sbrk_partial_shrink_keeps_page_still_in_use) {
@@ -231,12 +211,12 @@ TEST(sbrk_too_much_memory_returns_enomem) {
     a.emit({ADDI, s0, a0, 0, 0});    // s0 = -ENOMEM
     a.sbrk(0);                       // break unchanged
     a.emit({ADDI, s1, a0, 0, 0});
+    expect_reg(a, s1, kInitialBreak);
     a.sbrk(4096);                    // a normal request still succeeds
     a.emit({SW, 0, a0, s0, 0});      // and the memory is usable
     a.emit({ADDI, a0, s0, 0, 0});
     a.exit_with_a0();
     CHECK_EQ(exit_status(run(m, a)), -kEnomem);
-    CHECK_EQ(m.cpu().reg(s1), kInitialBreak);
 }
 
 TEST(sbrk_running_out_of_frames_changes_nothing) {
@@ -246,12 +226,12 @@ TEST(sbrk_running_out_of_frames_changes_nothing) {
     Asm a;
     a.sbrk(0x100000 - 4096);
     a.emit({ADDI, s0, a0, 0, 0});
+    expect_reg(a, s0, -kEnomem);
     a.li(t0, kInitialBreak);
     a.emit({LW, t1, t0, 0, 0});      // must fault: no page was kept
     a.exit_with_a0();
     const cpu::Trap t = killed_by(run(m, a));
     CHECK_EQ(t.cause, cpu::Cause::load_page_fault);
-    CHECK_EQ(static_cast<int32_t>(m.cpu().reg(s0)), -kEnomem);
 }
 
 TEST(sbrk_into_stack_region_returns_enomem) {
@@ -271,10 +251,10 @@ TEST(sbrk_below_initial_break_returns_einval) {
     a.emit({ADDI, s0, a0, 0, 0});
     a.sbrk(0);
     a.emit({ADDI, s1, a0, 0, 0});    // unchanged: initial break + 100
+    expect_reg(a, s1, kInitialBreak + 100);
     a.emit({ADDI, a0, s0, 0, 0});
     a.exit_with_a0();
     CHECK_EQ(exit_status(run(m, a)), -kEinval);
-    CHECK_EQ(m.cpu().reg(s1), kInitialBreak + 100);
 }
 
 TEST(sbrk_when_ram_is_full_returns_enomem) {
@@ -284,10 +264,10 @@ TEST(sbrk_when_ram_is_full_returns_enomem) {
     Asm a;
     a.sbrk(239 * 4096);
     a.emit({ADDI, s0, a0, 0, 0});
+    expect_reg(a, s0, kInitialBreak);   // the first, exact-fit request worked
     a.sbrk(1);
     a.exit_with_a0();
     CHECK_EQ(exit_status(run(m, a)), -kEnomem);
-    CHECK_EQ(m.cpu().reg(s0), kInitialBreak);   // the first, exact-fit request worked
 }
 
 TEST(sbrk_whole_new_page_is_zero_filled) {

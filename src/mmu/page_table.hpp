@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace mmu {
 
@@ -34,6 +35,9 @@ public:
 
     // The mapping for `vpn`, or nullopt if the page is not mapped.
     std::optional<Pte> lookup(uint32_t vpn) const;
+
+    // Every mapped virtual page number, in increasing order.
+    std::vector<uint32_t> mapped_pages() const;
 
 private:
     std::unordered_map<uint32_t, Pte> entries_;

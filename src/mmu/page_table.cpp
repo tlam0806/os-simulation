@@ -46,4 +46,14 @@ std::optional<uint32_t> translate(const PageTable& table, uint32_t vaddr, Access
     return (frame << kPageShift) | offset;
 }
 
+// TODO: implement. tests/page_table_test.cpp (page_table_mapped_pages) describes it.
+std::vector<uint32_t> PageTable::mapped_pages() const { 
+    std::vector<uint32_t> returned;
+    returned.reserve(entries_.size());
+    for (auto& [vpn, pte] : entries_) {
+        returned.push_back(vpn);
+    }
+    return returned;
+}
+
 }  // namespace mmu

@@ -63,6 +63,8 @@ add_executable(ossim_tests
   tests/kernel_sbrk_test.cpp
   tests/machine_timer_test.cpp
   tests/cpu_context_test.cpp
+  tests/kernel_process_test.cpp
+  tests/kernel_scheduler_test.cpp
 )
 target_link_libraries(ossim_tests PRIVATE ossim_core)
 add_test(NAME ossim_tests COMMAND ossim_tests)
