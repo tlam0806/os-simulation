@@ -177,8 +177,8 @@ This is everything the hardware holds. A process's CPU context is the first row;
 
 - **User addresses are below `0x80000000`.** The upper half is reserved, so any access to it faults.
 - **Null guard:** `0x00000000`–`0x0000FFFF` is never mapped, so a null-pointer access faults.
-- **Stack:** the initial `sp` is `0x80000000`, which meets the RISC-V ABI's 16-byte alignment rule. The stack region is `0x7FF00000`–`0x7FFFFFFF`. The loader maps the top 16 pages (64 KiB) read+write; the kernel may map more on demand later.
-- **Heap:** the initial break is the end of the highest loaded segment, rounded up to 4 KiB. It moves with `sbrk` and cannot grow past `0x7FF00000`.
+- **Stack:** the initial `sp` is `0x80000000`, which meets the RISC-V ABI's 16-byte alignment rule. The stack region is `0x7FF00000`–`0x7FFFFFFF`. The loader maps the top 16 pages (64 KiB) read+write. The rest of the region is mapped **on demand**: a load or store page fault at an unmapped stack address makes the kernel map a zero-filled read+write page and retry the instruction. A fault anywhere else, a permission fault, or a fault when no frame is free kills the process (a *segmentation fault*).
+- **Heap:** the initial break is the end of the highest loaded segment, rounded up to 4 KiB. It moves with `sbrk` and cannot grow past `0x7FF00000`. Heap pages are mapped **lazily**: `sbrk` only moves the break, and a page from the initial break up to the page holding the last heap byte is mapped (zero-filled, read+write) the first time it is accessed, like the stack. If no frame is free at that moment, the process is killed: a successful `sbrk` does not guarantee memory (*overcommit*).
 - **New pages are always zero-filled**, so a process can never see another process's old data.
 
 ## B2. Program format and loading
@@ -223,6 +223,8 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 
 For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 
+`sbrk` returns `-EINVAL` if the new break would be below the initial break, and `-ENOMEM` if it would be above `0x7FF00000`. Otherwise it always succeeds: it maps nothing (see B1). Shrinking unmaps the heap pages the heap no longer covers and frees their frames.
+
 **Error codes** use Linux's values so they are familiar:
 
 | Name | Value | Meaning |
@@ -236,7 +238,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 **Rules:**
 
 - An unknown system call number returns `-ENOSYS`. The process is not killed.
-- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (for example a stack page not yet allocated), the kernel maps the page and continues. The `ECALL` is never re-executed, so its side effects can't happen twice.
+- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. If no frame is free for it, the call returns `-EFAULT`. The `ECALL` is never re-executed, so its side effects can't happen twice.
 
 ---
 

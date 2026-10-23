@@ -54,8 +54,8 @@ Continue Kernel::sys_write() {
 
 Continue Kernel::sys_sbrk() {
     int32_t n = static_cast<int32_t>(cpu().reg(isa::reg::a0));
-    int64_t new_break = current_break() + n;
     uint32_t old_break = current_break();
+    int64_t new_break = old_break + n;
     if (new_break < initial_break()) {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
         return Continue{};
@@ -64,30 +64,18 @@ Continue Kernel::sys_sbrk() {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnomem));
         return Continue{};
     }
-    if (n > 0 && mmu::get_vpn(new_break - 1) - mmu::get_vpn(current_break() - 1) > frame_allocator().free_count()) {
-        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnomem));
+    cpu().set_reg(isa::reg::a0, old_break);
+    process().brk = new_break;
+    if (n >= 0) {
         return Continue{};
     }
-    while (current_break() < new_break) {
-        uint32_t next_break = current_break() + 1;
-        uint32_t cur_vpn = mmu::get_vpn(current_break() - 1);
-        uint32_t next_vpn = mmu::get_vpn(current_break());
-        if (cur_vpn != next_vpn) {
-            map_page(next_vpn);
-        }
-        process().brk = next_break;
-    }
-    while (current_break() > new_break) {
-        uint32_t next_break = current_break() - 1;
-        uint32_t cur_vpn = mmu::get_vpn(next_break);
-        uint32_t next_vpn = mmu::get_vpn(next_break - 1);
-        if (cur_vpn != next_vpn) {
-            unmap_page(cur_vpn);
-        }
-        process().brk = next_break;
+    // shrink the heap
+    uint32_t old_vpn = mmu::get_vpn(old_break - 1);
+    uint32_t new_vpn = mmu::get_vpn(new_break - 1);
+    for (uint32_t vpn = new_vpn + 1; vpn <= old_vpn; ++vpn) { // iterate through every pages through unmap 
+        unmap_page(vpn);
     }
     assert(current_break() == new_break);
-    cpu().set_reg(isa::reg::a0, old_break);
     return Continue{};
 }
 
@@ -108,6 +96,23 @@ Continue Kernel::sys_other() {
 
 // ---- memory helpers ----
 
+bool Kernel::in_region(uint64_t large_addr) {
+    if (large_addr > UINT32_MAX) {
+        return false;
+    }
+    uint32_t addr = static_cast<uint32_t>(large_addr);
+    if (loader::kStackRegion <= addr && addr < loader::kStackTop) {
+        return true;
+    }
+    uint32_t vpn = mmu::get_vpn(addr);
+    uint32_t first_vpn = mmu::get_vpn(initial_break());
+    uint32_t last_vpn = mmu::get_vpn(current_break() - 1);
+    if (first_vpn <= vpn && vpn <= last_vpn) {
+        return true;
+    }
+    return false;
+}
+
 void Kernel::zero_frame(uint32_t frame) {
     for (uint32_t addr = frame * mmu::kPageSize; addr < frame * mmu::kPageSize + mmu::kPageSize; addr += 4) {
         bool writable = ram().write(addr, 4, 0);
@@ -115,13 +120,19 @@ void Kernel::zero_frame(uint32_t frame) {
     }
 }
 
-std::optional<std::vector<uint8_t>> Kernel::read_memory_on_ram(uint32_t addr, uint32_t bytes_count) const {
+std::optional<std::vector<uint8_t>> Kernel::read_memory_on_ram(uint32_t addr, uint32_t bytes_count) {
     std::vector<uint8_t> returned;
     mem::Ram& ram = machine_.ram();
     while (bytes_count > 0) {
         std::optional<uint32_t> physical_addr = mmu::translate(page_table(), addr, mmu::Access::load);
         if (!physical_addr) {
-            return std::nullopt;
+            if (!in_region(addr)) {
+                return std::nullopt;
+            }
+            bool created = map_page(mmu::get_vpn(addr));
+            if (!created) return std::nullopt;
+            physical_addr = mmu::translate(page_table(), addr, mmu::Access::load);
+            assert(physical_addr);
         }
         std::optional<uint32_t> readed = ram.read(*physical_addr, 1);
         if (!readed) {
@@ -134,19 +145,23 @@ std::optional<std::vector<uint8_t>> Kernel::read_memory_on_ram(uint32_t addr, ui
     return returned;
 }
 
-void Kernel::map_page(uint32_t vpn) {
+bool Kernel::map_page(uint32_t vpn) {
     std::optional<uint32_t> physical_frame = frame_allocator().allocate();
-    assert(physical_frame);
+    if (!physical_frame) return false;
     mmu::Pte pte{*physical_frame, true, true, false};
     zero_frame(*physical_frame);
     page_table().map(vpn, pte);
+    return true;
 }
 
-void Kernel::unmap_page(uint32_t vpn) {
+bool Kernel::unmap_page(uint32_t vpn) {
     auto pte = page_table().lookup(vpn);
-    assert(pte);
+    if (!pte) {
+        return false;
+    }
     frame_allocator().free(pte->frame);
     page_table().unmap(vpn);
+    return true;
 }
 
 }  // namespace kernel

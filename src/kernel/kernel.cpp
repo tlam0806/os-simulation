@@ -9,12 +9,33 @@
 
 namespace kernel {
 
+std::variant<Killed, Continue> Kernel::handle_page_fault(const cpu::Trap& trap) {
+    uint32_t addr = trap.tval;
+    if (!in_region(addr)) {
+        return Killed{trap};
+    }
+    // the address is valid, inside the region
+    uint32_t vpn = mmu::get_vpn(addr);
+    std::optional<mmu::Pte> found = page_table().lookup(vpn);
+    if (found) {
+        return Killed{trap};
+    }
+    // not mapped yet, should create a new one
+    if (!map_page(vpn)) {
+        return Killed{trap};
+    }
+    return Continue{};
+}
+
 std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Trap& trap) {
     switch (trap.cause) {
         case cpu::Cause::ecall :
             return util::convert_variant<Exited, Killed, Continue, Switch>(handle_syscall());
         case cpu::Cause::timer_interrupt :
             return Switch{};
+        case cpu::Cause::load_page_fault :
+        case cpu::Cause::store_page_fault : 
+            return util::convert_variant<Exited, Killed, Continue, Switch>(handle_page_fault(trap));
         default :
             return Killed{trap};   // any fault ends the process
     }

@@ -3,12 +3,15 @@
 //
 // Expected behavior:
 //   - The break starts at the loader's initial_break (the page after the program).
-//   - Growing maps every page that the heap [initial_break, new break) now
-//     touches: read+write, not executable, zero-filled.
-//   - Shrinking unmaps pages the heap no longer touches and frees their frames.
+//   - Growing only moves the break. Each heap page (from initial_break up to the
+//     page holding the last heap byte) is mapped the first time the program
+//     touches it: read+write, not executable, zero-filled. See also
+//     kernel_lazy_heap_test.cpp.
+//   - Shrinking unmaps the pages the heap no longer covers and frees their frames.
 //   - The break can't go below initial_break (-EINVAL) or past the stack
-//     region at 0x7ff00000 (-ENOMEM). If there aren't enough free frames, the
-//     result is -ENOMEM. On any error nothing changes.
+//     region at 0x7ff00000 (-ENOMEM). On those errors nothing changes.
+//   - Otherwise sbrk always succeeds, even beyond RAM (overcommit): running out
+//     of frames shows up later, as a page fault that kills the process.
 #include <cstdint>
 #include <variant>
 #include <vector>
@@ -154,6 +157,10 @@ TEST(sbrk_shrink_returns_old_break_and_unmaps) {
     Asm a;
     a.sbrk(8192);
     a.emit({ADDI, s0, a0, 0, 0});    // s0 = start of the heap
+    a.emit({SW, 0, s0, zero, 0});    // touch both pages, so they get mapped
+    a.li(t0, 4096);
+    a.emit({ADD, t0, s0, t0, 0});
+    a.emit({SW, 0, t0, zero, 0});
     a.sbrk(-8192);                   // a0 = old break = s0 + 8192
     a.emit({SUB, s1, a0, s0, 0});    // s1 = 8192
     expect_reg(a, s1, 8192);
@@ -180,14 +187,23 @@ TEST(sbrk_partial_shrink_keeps_page_still_in_use) {
 }
 
 TEST(sbrk_shrink_frees_frames) {
-    // Grow and shrink by 64 KiB, 100 times. That's 1600 pages in total, but
-    // RAM has only 256 frames: this only works if shrinking gives frames back.
+    // Grow by 64 KiB, touch every page, shrink again: 100 times. That's 1600
+    // pages in total, but RAM has only 256 frames: this only works if
+    // shrinking gives frames back.
     machine::Machine m;
     Asm a;
     a.li(s1, 100);
     const size_t loop = a.here();
     a.sbrk(65536);
     const size_t fail1 = a.branch(BLT, a0, zero);
+    a.emit({ADDI, t0, a0, 0, 0});    // touch all 16 new pages
+    a.li(t1, 4096);
+    a.li(t3, 16);
+    const size_t touch = a.here();
+    a.emit({SW, 0, t0, zero, 0});
+    a.emit({ADD, t0, t0, t1, 0});
+    a.emit({ADDI, t3, t3, 0, -1});
+    a.patch(a.branch(BNE, t3, zero), touch);
     a.sbrk(-65536);
     const size_t fail2 = a.branch(BLT, a0, zero);
     a.emit({ADDI, s1, s1, 0, -1});
@@ -203,35 +219,40 @@ TEST(sbrk_shrink_frees_frames) {
 
 // ---- errors ----
 
-TEST(sbrk_too_much_memory_returns_enomem) {
-    // 112 MiB: far more than 1 MiB of RAM. Nothing changes, and memory still works after.
+TEST(sbrk_more_than_ram_succeeds) {
+    // 112 MiB: far more than 1 MiB of RAM, but nothing is mapped yet, so it works.
     machine::Machine m;
     Asm a;
     a.sbrk(0x7000000);
-    a.emit({ADDI, s0, a0, 0, 0});    // s0 = -ENOMEM
-    a.sbrk(0);                       // break unchanged
+    a.emit({ADDI, s0, a0, 0, 0});
+    expect_reg(a, s0, kInitialBreak);           // the old break: success
+    a.sbrk(0);
     a.emit({ADDI, s1, a0, 0, 0});
-    expect_reg(a, s1, kInitialBreak);
-    a.sbrk(4096);                    // a normal request still succeeds
-    a.emit({SW, 0, a0, s0, 0});      // and the memory is usable
-    a.emit({ADDI, a0, s0, 0, 0});
+    expect_reg(a, s1, kInitialBreak + 0x7000000);
+    a.li(t1, 5);
+    a.emit({SW, 0, s0, t1, 0});                 // the first page works when touched
+    a.emit({LW, a0, s0, 0, 0});
     a.exit_with_a0();
-    CHECK_EQ(exit_status(run(m, a)), -kEnomem);
+    CHECK_EQ(exit_status(run(m, a)), 5);
 }
 
-TEST(sbrk_running_out_of_frames_changes_nothing) {
-    // Ask for slightly less than all of RAM: the program and stack already use
-    // some frames, so this can't fit. A partial grow must not stay mapped.
+TEST(sbrk_touching_more_than_ram_kills) {
+    // The heap is bigger than RAM; touching page after page eventually finds no
+    // free frame. That access is a page fault the kernel can't fix: the process
+    // is killed, and every frame it had comes back.
     machine::Machine m;
     Asm a;
-    a.sbrk(0x100000 - 4096);
-    a.emit({ADDI, s0, a0, 0, 0});
-    expect_reg(a, s0, -kEnomem);
-    a.li(t0, kInitialBreak);
-    a.emit({LW, t1, t0, 0, 0});      // must fault: no page was kept
-    a.exit_with_a0();
+    a.sbrk(0x100000);                // 256 pages
+    a.emit({ADDI, t0, a0, 0, 0});
+    a.li(t1, 4096);
+    const size_t loop = a.here();
+    a.emit({SW, 0, t0, zero, 0});
+    a.emit({ADD, t0, t0, t1, 0});
+    a.patch(a.branch(JAL, zero, zero), loop);   // until killed
     const cpu::Trap t = killed_by(run(m, a));
-    CHECK_EQ(t.cause, cpu::Cause::load_page_fault);
+    CHECK_EQ(t.cause, cpu::Cause::store_page_fault);
+    CHECK(t.tval >= kInitialBreak && t.tval < kInitialBreak + 0x100000);   // inside the heap
+    CHECK_EQ(m.frame_allocator().free_count(), mmu::kNumFrames);
 }
 
 TEST(sbrk_into_stack_region_returns_enomem) {
@@ -257,17 +278,38 @@ TEST(sbrk_below_initial_break_returns_einval) {
     CHECK_EQ(exit_status(run(m, a)), -kEinval);
 }
 
-TEST(sbrk_when_ram_is_full_returns_enomem) {
-    // The program (1 page) and stack (16 pages) use 17 frames, leaving 239.
-    // Take all 239, then ask for one more byte: that needs a new page.
+TEST(sbrk_reserved_heap_uses_no_frames) {
+    // Process 1 reserves 200 pages and never touches them; process 2 then uses
+    // 30 pages. With eager mapping, process 1 would hold 200 of the 222 free
+    // frames and process 2's sbrk would fail. With lazy mapping both are fine.
     machine::Machine m;
-    Asm a;
-    a.sbrk(239 * 4096);
-    a.emit({ADDI, s0, a0, 0, 0});
-    expect_reg(a, s0, kInitialBreak);   // the first, exact-fit request worked
-    a.sbrk(1);
-    a.exit_with_a0();
-    CHECK_EQ(exit_status(run(m, a)), -kEnomem);
+    std::ostringstream out, err;
+    kernel::Kernel k(m, out, err);
+    Asm one;
+    one.sbrk(200 * 4096);
+    one.syscall(SYS_YIELD);          // let process 2 run while the heap is reserved
+    one.exit_with_a0();              // a0 = 0 from yield
+    Asm two;
+    two.sbrk(30 * 4096);
+    expect_reg(two, a0, kInitialBreak);
+    two.emit({ADDI, t0, a0, 0, 0});
+    two.li(t1, 4096);
+    two.li(t3, 30);
+    const size_t loop = two.here();
+    two.emit({SW, 0, t0, zero, 0});
+    two.emit({ADD, t0, t0, t1, 0});
+    two.emit({ADDI, t3, t3, 0, -1});
+    two.patch(two.branch(BNE, t3, zero), loop);
+    two.exit_with(0);
+    for (const Asm* a : {&one, &two})
+        CHECK(std::holds_alternative<uint32_t>(k.spawn(elf_builder::make_elf(0x10000, {{0x10000, elf_builder::code(a->code)}}))));
+    CHECK(std::holds_alternative<kernel::AllDone>(k.run_all(1'000'000)));
+    for (uint32_t pid : {1u, 2u}) {
+        const auto e = k.ending(pid);
+        const auto* exited = e ? std::get_if<kernel::Exited>(&*e) : nullptr;
+        CHECK(exited != nullptr);
+        if (exited) CHECK_EQ(exited->exit_status, 0);
+    }
 }
 
 TEST(sbrk_whole_new_page_is_zero_filled) {

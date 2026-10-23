@@ -87,7 +87,7 @@ private :
     
     std::variant<Exited, Continue, Switch> handle_syscall();
 
-    std::optional<std::vector<uint8_t>> read_memory_on_ram(uint32_t addr, uint32_t bytes_count) const; 
+    std::optional<std::vector<uint8_t>> read_memory_on_ram(uint32_t addr, uint32_t bytes_count); 
 
     Exited sys_exit(); // 1 
 
@@ -98,6 +98,8 @@ private :
     Continue sys_other(); // other
 
     Continue sys_getpid();
+
+    std::variant<Killed, Continue> handle_page_fault(const cpu::Trap& trap);
 
     Switch sys_yield();
 
@@ -137,9 +139,11 @@ private :
         return machine_.frame_allocator();
     }
 
-    void map_page(uint32_t vpn);
+    bool in_region(uint64_t addr);
 
-    void unmap_page(uint32_t vpn);
+    bool map_page(uint32_t vpn);
+
+    bool unmap_page(uint32_t vpn);
 
     void zero_frame(uint32_t frame);
 
