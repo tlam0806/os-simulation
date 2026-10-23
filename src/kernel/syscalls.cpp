@@ -21,6 +21,8 @@ std::variant<Exited, Continue, Switch> Kernel::handle_syscall() {
             return sys_getpid();
         case abi::kSysYield :
             return sys_yield();
+        case abi::kSysFork : 
+            return sys_fork();
         default :
             return sys_other();
     }
@@ -89,12 +91,60 @@ Switch Kernel::sys_yield() {
     return Switch{};
 }
 
+std::optional<mmu::PageTable> Kernel::inherit_table(const mmu::PageTable& other) {
+    mmu::PageTable inherited;
+    std::vector<uint32_t> pages = other.mapped_pages();
+    if (pages.size() > frame_allocator().free_count()) {
+        return std::nullopt;
+    }
+    for (uint32_t vpn : pages) {
+        std::optional<uint32_t> new_frame = frame_allocator().allocate();
+        assert(new_frame);
+        std::optional<mmu::Pte> pte = other.lookup(vpn);
+        assert(pte); // should be in the old page table
+        copy_frame(pte->frame, *new_frame);
+        mmu::Pte new_pte = *pte;
+        new_pte.frame = *new_frame;
+        inherited.map(vpn, new_pte);
+    }
+    return inherited;
+}
+
+Continue Kernel::sys_fork() {
+    Process copied = process();
+    copied.parent_pid = executing_pid;
+    copied.context = cpu().context();  // update context
+    copied.context.regs[isa::reg::a0] = 0; 
+    std::optional<mmu::PageTable> inherited = inherit_table(page_table());
+    if (!inherited) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnomem));
+        return Continue{};
+    }
+    copied.page_table = *inherited;
+    uint32_t child_pid = create_process(std::move(copied));
+    cpu().set_reg(isa::reg::a0, child_pid);
+    return Continue{};
+}
+
+std::variant<Continue, Switch> Kernel::sys_wait() {
+
+}
+
+Continue Kernel::sys_exec() {
+
+}
+
 Continue Kernel::sys_other() {
     cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnosys));
     return Continue{};
 }
 
 // ---- memory helpers ----
+
+void Kernel::copy_frame(uint32_t from_frame, uint32_t to_frame) {
+    bool copied = ram().copy(from_frame * mmu::kPageSize, to_frame * mmu::kPageSize, mmu::kPageSize);
+    assert(copied);
+}
 
 bool Kernel::in_region(uint64_t large_addr) {
     if (large_addr > UINT32_MAX) {

@@ -8,7 +8,8 @@
 #include "isa/isa.hpp"
 
 // System call numbers (spec B3).
-inline constexpr int32_t SYS_EXIT = 1, SYS_WRITE = 2, SYS_SBRK = 3, SYS_GETPID = 4, SYS_YIELD = 5;
+inline constexpr int32_t SYS_EXIT = 1, SYS_WRITE = 2, SYS_SBRK = 3, SYS_GETPID = 4, SYS_YIELD = 5,
+                         SYS_FORK = 6, SYS_EXEC = 7, SYS_WAIT = 8;
 
 struct Asm {
     using enum isa::Op;

@@ -12,10 +12,14 @@ inline constexpr uint32_t kSysWrite = 2;
 inline constexpr uint32_t kSysSbrk = 3;
 inline constexpr uint32_t kSysGetpid = 4;
 inline constexpr uint32_t kSysYield = 5;
+inline constexpr uint32_t kSysFork = 6;
+inline constexpr uint32_t kSysExec = 7;   // not defined yet
+inline constexpr uint32_t kSysWait = 8;
 
 // Error codes, using Linux's values. A failed call returns -code in a0.
 // (Not EBADF etc.: those names are macros in <errno.h>.)
 inline constexpr int32_t kEbadf = 9;    // bad file descriptor
+inline constexpr int32_t kEchild = 10;  // no child to wait for
 inline constexpr int32_t kEnomem = 12;  // out of memory
 inline constexpr int32_t kEfault = 14;  // bad pointer passed to the kernel
 inline constexpr int32_t kEinval = 22;  // invalid argument

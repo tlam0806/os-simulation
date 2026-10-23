@@ -36,6 +36,22 @@ public :
         return true;
     }   
 
+    bool copy(uint32_t from, uint32_t to, uint32_t size) {
+        // [from, from + size) should not overlap with [to, to + size), otherwise it is UB
+        uint64_t max_reach = static_cast<uint64_t>(std::max(from, to) + size);
+        if (max_reach > static_cast<uint64_t>(memory.size())) {
+            return false;
+        }
+        for (uint32_t i = 0; i < size; ++i) {
+            uint32_t from_addr = from + i;
+            uint32_t to_addr = to + i;
+            assert(from_addr < memory.size());
+            assert(to_addr < memory.size());
+            memory[to_addr] = memory[from_addr];
+        }
+        return true;
+    }
+
 private :
     std::vector<uint8_t> memory = std::vector<uint8_t>(kRamSize);
 };

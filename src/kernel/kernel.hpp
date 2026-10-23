@@ -89,13 +89,19 @@ private :
 
     std::optional<std::vector<uint8_t>> read_memory_on_ram(uint32_t addr, uint32_t bytes_count); 
 
-    Exited sys_exit(); // 1 
+    Exited sys_exit(); 
 
-    Continue sys_write(); // 2
+    Continue sys_write(); 
 
-    Continue sys_sbrk(); // 3
+    Continue sys_sbrk(); 
 
-    Continue sys_other(); // other
+    Continue sys_fork();
+
+    std::variant<Continue, Switch> sys_wait();
+
+    Continue sys_exec();
+
+    Continue sys_other(); 
 
     Continue sys_getpid();
 
@@ -111,7 +117,7 @@ private :
         return machine_.cpu();
     }
 
-    Process& process() {
+    Process& process() {  // context is not up to date when the process is running, needs to load again
         return process_table_.find(executing_pid)->second;
     }
 
@@ -129,6 +135,10 @@ private :
         Process& process = process_table_.find(executing_pid)->second;
         return process.page_table;
     }
+
+    std::optional<mmu::PageTable> inherit_table(const mmu::PageTable& other); // null if theres not enough frame to allocate
+
+    void copy_frame(uint32_t old_frame, uint32_t new_frame);
 
     const mmu::PageTable& page_table() const {
         const Process& process = process_table_.find(executing_pid)->second;
@@ -156,6 +166,10 @@ private :
     void load_process(Process& process);
 
     uint64_t run_helper(uint64_t max_step);
+    
+    uint32_t create_process(Process&& process);
+
+    
 };
 
 

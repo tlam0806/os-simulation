@@ -178,3 +178,14 @@ TEST(page_table_mapped_pages) {
         CHECK_EQ(pages[1], 0x7ffff);
     }
 }
+
+TEST(page_table_mapped_pages_sorted_for_many_pages) {
+    // With many pages, a hash table's own order is almost never sorted.
+    mmu::PageTable t;
+    for (uint32_t i = 0; i < 300; i++) t.map((i * 7919) % 100000, rwx(i % 256));   // scattered vpns
+    const std::vector<uint32_t> pages = t.mapped_pages();
+    CHECK_EQ(pages.size(), 300);
+    bool sorted = true;
+    for (size_t i = 1; i < pages.size(); i++) sorted = sorted && pages[i - 1] < pages[i];
+    CHECK(sorted);
+}

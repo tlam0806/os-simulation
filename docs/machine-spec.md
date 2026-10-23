@@ -219,17 +219,35 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 | 3 | `sbrk` | `a0` = bytes to grow (may be negative) | Old break | 3 |
 | 4 | `getpid` | — | Process ID | 4 |
 | 5 | `yield` | — | 0 | 4 |
-| 6–8 | `fork`, `exec`, `wait` | To be defined | | 5 |
+| 6 | `fork` | — | In the parent: the child's pid. In the child: 0 | 5 |
+| 7 | `exec` | To be defined | | 5 |
+| 8 | `wait` | `a0` = pid to wait for (−1: any child), `a1` = address to store the status (0: don't store) | The pid of the child that ended | 5 |
 
 For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 
 `sbrk` returns `-EINVAL` if the new break would be below the initial break, and `-ENOMEM` if it would be above `0x7FF00000`. Otherwise it always succeeds: it maps nothing (see B1). Shrinking unmaps the heap pages the heap no longer covers and frees their frames.
+
+**`fork`** creates a new process, the *child*, as a copy of the caller, the *parent*:
+
+- **Memory:** every page mapped in the parent is copied into a new frame, with the same virtual address and permissions. After `fork`, parent and child never see each other's writes.
+- **Registers and `pc`:** the same in both, so both continue after the `ecall`. Only `a0` differs: the child's pid in the parent, 0 in the child.
+- **Break:** the child starts with the parent's `initial_break` and break, including heap pages that were never touched (they stay valid and unmapped).
+- **pid:** the next unused pid. The child's *parent* is the caller.
+- If there aren't enough free frames to copy every mapped page, `fork` returns `-ENOMEM` and creates nothing.
+
+**`wait`** lets a parent collect a child that has ended:
+
+- It waits for a child of the caller that has ended: the one with pid `a0`, or any child if `a0` is −1. If such a child has already ended, it returns at once. Otherwise the caller is **blocked**: it doesn't run until such a child ends.
+- It returns the child's pid. If `a1` isn't 0, it stores the child's status there as a 32-bit word: the exit status if the child called `exit`, or 128 + the trap cause if it was killed. Then the child is forgotten: a second `wait` can't collect it again.
+- If the caller has no child matching `a0` (ended or still running), it returns `-ECHILD` at once.
+- A child whose parent has ended has no parent; nobody can wait for it.
 
 **Error codes** use Linux's values so they are familiar:
 
 | Name | Value | Meaning |
 |---|---|---|
 | `EBADF` | 9 | Bad file descriptor |
+| `ECHILD` | 10 | No child to wait for |
 | `ENOMEM` | 12 | Out of memory |
 | `EFAULT` | 14 | Bad pointer passed to the kernel |
 | `EINVAL` | 22 | Invalid argument |
@@ -261,7 +279,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 |---|---|
 | What happens when physical RAM runs out: kill the process, or swap? | Milestone 3 |
 | Layout of `argc`/`argv` on the initial stack | Milestone 5 |
-| Exact semantics of `fork`, `exec` and `wait` | Milestone 5 |
+| How `exec` names the program to run (there is no file system yet) | Milestone 5 |
 | Reading input (`read`, stdin) | Later |
 
 ## Appendix: Toolchain

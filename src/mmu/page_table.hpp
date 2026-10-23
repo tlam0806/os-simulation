@@ -6,6 +6,7 @@
 #include <optional>
 #include <unordered_map>
 #include <vector>
+#include <map>
 
 namespace mmu {
 
@@ -40,7 +41,7 @@ public:
     std::vector<uint32_t> mapped_pages() const;
 
 private:
-    std::unordered_map<uint32_t, Pte> entries_;
+    std::map<uint32_t, Pte> entries_;
 };
 
 // Translates `vaddr` for one kind of access.

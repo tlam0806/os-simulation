@@ -9,6 +9,13 @@
 
 namespace kernel {
 
+uint32_t Kernel::create_process(Process&& process) {
+    uint32_t pid = ++next_pid_;
+    process.pid = pid;
+    process_table_.emplace(process.pid, std::move(process));
+    return pid;
+}
+
 std::variant<Killed, Continue> Kernel::handle_page_fault(const cpu::Trap& trap) {
     uint32_t addr = trap.tval;
     if (!in_region(addr)) {
@@ -53,10 +60,7 @@ std::variant<uint32_t, std::string> Kernel::spawn(std::span<const uint8_t> elf) 
     process.brk = process.initial_break = program.initial_break;
     process.context.pc = program.entry;
     process.context.regs[isa::reg::sp] = static_cast<uint32_t>(loader::kStackTop);
-    uint32_t pid = ++next_pid_;
-    process.pid = pid;
-    process_table_.emplace(process.pid, std::move(process));
-    return pid;
+    return create_process(std::move(process));
 }
 
 const Process* Kernel::process(uint32_t pid) const {
