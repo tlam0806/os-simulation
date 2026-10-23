@@ -8,6 +8,8 @@
 
 namespace kernel {
 
+const uint32_t init = 0;
+
 struct Process {
     uint32_t pid = 0;
     uint32_t parent_pid = 0;

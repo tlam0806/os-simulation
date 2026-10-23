@@ -240,6 +240,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 - It waits for a child of the caller that has ended: the one with pid `a0`, or any child if `a0` is −1. If such a child has already ended, it returns at once. Otherwise the caller is **blocked**: it doesn't run until such a child ends.
 - It returns the child's pid. If `a1` isn't 0, it stores the child's status there as a 32-bit word: the exit status if the child called `exit`, or 128 + the trap cause if it was killed. Then the child is forgotten: a second `wait` can't collect it again.
 - If the caller has no child matching `a0` (ended or still running), it returns `-ECHILD` at once.
+- If `a1` isn't 0 and the status can't be stored there (the address isn't 4-byte aligned, like `SW`, or isn't writable by the caller), it returns `-EFAULT` and the child is **not** collected. Like `write`, the kernel maps an untouched heap or stack page first.
 - A child whose parent has ended has no parent; nobody can wait for it.
 
 **Error codes** use Linux's values so they are familiar:

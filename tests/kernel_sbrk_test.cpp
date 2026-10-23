@@ -306,7 +306,7 @@ TEST(sbrk_reserved_heap_uses_no_frames) {
     CHECK(std::holds_alternative<kernel::AllDone>(k.run_all(1'000'000)));
     for (uint32_t pid : {1u, 2u}) {
         const auto e = k.ending(pid);
-        const auto* exited = e ? std::get_if<kernel::Exited>(&*e) : nullptr;
+        const auto* exited = e ? std::get_if<kernel::Exited>(&e->reason) : nullptr;
         CHECK(exited != nullptr);
         if (exited) CHECK_EQ(exited->exit_status, 0);
     }

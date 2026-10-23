@@ -55,7 +55,7 @@ struct System {
     int32_t status(uint32_t pid) {
         const auto e = k.ending(pid);
         CHECK(e.has_value());
-        const auto* exited = e ? std::get_if<kernel::Exited>(&*e) : nullptr;
+        const auto* exited = e ? std::get_if<kernel::Exited>(&e->reason) : nullptr;
         CHECK(exited != nullptr);
         return exited ? exited->exit_status : -12345;
     }

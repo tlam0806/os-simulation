@@ -50,6 +50,48 @@ std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Tr
 
 // ---- processes ----
 
+std::optional<mmu::PageTable> Kernel::inherit_table(const mmu::PageTable& other) {
+    mmu::PageTable inherited;
+    std::vector<uint32_t> pages = other.mapped_pages();
+    if (pages.size() > frame_allocator().free_count()) {
+        return std::nullopt;
+    }
+    for (uint32_t vpn : pages) {
+        std::optional<uint32_t> new_frame = frame_allocator().allocate();
+        assert(new_frame);
+        std::optional<mmu::Pte> pte = other.lookup(vpn);
+        assert(pte); // should be in the old page table
+        copy_frame(pte->frame, *new_frame);
+        mmu::Pte new_pte = *pte;
+        new_pte.frame = *new_frame;
+        inherited.map(vpn, new_pte);
+    }
+    return inherited;
+}
+
+std::vector<uint32_t> Kernel::get_running_children_process(uint32_t parent_pid, uint32_t required_pid) {
+    const uint32_t any = static_cast<uint32_t>(-1);
+    std::vector<uint32_t> returned;
+    for (const auto& [children_pid, process] : process_table_) {
+        if (process.parent_pid != parent_pid) continue;
+        if (required_pid != any && required_pid != children_pid) continue;
+        returned.push_back(children_pid);
+    }
+    return returned;
+}
+
+std::vector<uint32_t> Kernel::get_ended_children_process(uint32_t parent_pid, uint32_t required_pid) {
+    std::vector<uint32_t> returned;
+    const uint32_t any = static_cast<uint32_t>(-1);
+    for (const auto& [children_pid, ending] : ending_table_) {
+        if (ending.parent_pid != parent_pid) continue;
+        if (required_pid != any && required_pid != children_pid) continue;
+        if (ending.collected) continue;
+        returned.push_back(children_pid);
+    }
+    return returned;
+}
+
 std::variant<uint32_t, std::string> Kernel::spawn(std::span<const uint8_t> elf) {
     Process process;
     std::variant<loader::Program, std::string> load_result = loader::load_elf(elf, ram(), frame_allocator(), process.page_table);
@@ -85,12 +127,24 @@ Process& Kernel::find_next_process(uint32_t last_exec) {
     return it->second;
 }
 
-void Kernel::end_process(Process& process, Ending ending) {
+void Kernel::end_process(Process& process, std::variant<Exited, Killed> status) {
+    for (auto& [pid, other] : process_table_) {
+        if (other.parent_pid == process.pid) {
+            other.parent_pid = init;
+        }
+    }
+    for (auto& [pid, ending] : ending_table_) {
+        if (ending.parent_pid == process.pid) {
+            ending.parent_pid = init;
+        }
+    }
+    Ending ending{process.parent_pid, status, false};
     ending_table_.emplace(process.pid, ending);
     for (uint32_t vpn : process.page_table.mapped_pages()) {
         uint32_t frame = process.page_table.lookup(vpn)->frame;
         frame_allocator().free(frame);
     }
+
     process_table_.erase(process.pid); // should be last, because process is deleted
 }
 

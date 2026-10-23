@@ -4,6 +4,7 @@
 #include "kernel/abi.hpp"
 #include "kernel/kernel.hpp"
 #include "loader/elf.hpp"
+#include "util/variant.hpp"
 
 namespace kernel {
 
@@ -23,6 +24,8 @@ std::variant<Exited, Continue, Switch> Kernel::handle_syscall() {
             return sys_yield();
         case abi::kSysFork : 
             return sys_fork();
+        case abi::kSysWait :
+            return util::convert_variant<Exited, Continue, Switch>(sys_wait());
         default :
             return sys_other();
     }
@@ -91,25 +94,6 @@ Switch Kernel::sys_yield() {
     return Switch{};
 }
 
-std::optional<mmu::PageTable> Kernel::inherit_table(const mmu::PageTable& other) {
-    mmu::PageTable inherited;
-    std::vector<uint32_t> pages = other.mapped_pages();
-    if (pages.size() > frame_allocator().free_count()) {
-        return std::nullopt;
-    }
-    for (uint32_t vpn : pages) {
-        std::optional<uint32_t> new_frame = frame_allocator().allocate();
-        assert(new_frame);
-        std::optional<mmu::Pte> pte = other.lookup(vpn);
-        assert(pte); // should be in the old page table
-        copy_frame(pte->frame, *new_frame);
-        mmu::Pte new_pte = *pte;
-        new_pte.frame = *new_frame;
-        inherited.map(vpn, new_pte);
-    }
-    return inherited;
-}
-
 Continue Kernel::sys_fork() {
     Process copied = process();
     copied.parent_pid = executing_pid;
@@ -127,7 +111,45 @@ Continue Kernel::sys_fork() {
 }
 
 std::variant<Continue, Switch> Kernel::sys_wait() {
-
+    int32_t required_pid = static_cast<int32_t>(cpu().reg(isa::reg::a0));
+    // cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEchild));
+    std::vector<uint32_t> running = get_running_children_process(executing_pid, static_cast<uint32_t>(required_pid));
+    std::vector<uint32_t> ended = get_ended_children_process(executing_pid, static_cast<uint32_t>(required_pid));
+    if (running.empty() && ended.empty()) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEchild));
+        return Continue{};
+    }
+    if (ended.size()) {
+        uint32_t pid = *std::min_element(ended.begin(), ended.end());
+        auto it = ending_table_.find(pid);
+        assert(it != ending_table_.end());
+        Ending& end = it->second;
+        int32_t end_status = std::holds_alternative<Exited>(end.reason) 
+            ? std::get<Exited>(end.reason).exit_status 
+            : static_cast<int32_t>(std::get<Killed>(end.reason).trap.cause) + 128;
+        // cpu().set_reg(isa::reg::a1, end_status);
+        uint32_t addr = cpu().reg(isa::reg::a1);
+        if (addr == 0) {
+            end.collected = true;
+            cpu().set_reg(isa::reg::a0, pid);
+            return Continue{};    
+        }
+        if (addr % 4) {
+            cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
+            return Continue{};
+        }
+        auto physical_addr = try_access(page_table(), addr, mmu::Access::store);
+        if (!physical_addr) {
+            cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
+            return Continue{};
+        }
+        end.collected = true;
+        ram().write(*physical_addr, 4, end_status);
+        cpu().set_reg(isa::reg::a0, pid);
+        return Continue{};
+    } 
+    cpu().pc -= 4;
+    return Switch{};
 }
 
 Continue Kernel::sys_exec() {
@@ -140,6 +162,23 @@ Continue Kernel::sys_other() {
 }
 
 // ---- memory helpers ----
+
+std::optional<uint32_t> Kernel::try_access(mmu::PageTable& table, uint32_t addr, mmu::Access access) {
+    std::optional<uint32_t> physical_addr = mmu::translate(table, addr, access);
+    if (physical_addr) {
+        return *physical_addr;
+    }
+    if (!in_region(addr)) {
+        return std::nullopt;
+    }
+    bool created = map_page(mmu::get_vpn(addr));
+    if (!created) {
+        return std::nullopt;
+    }
+    physical_addr = mmu::translate(table, addr, mmu::Access::load);
+    assert(physical_addr);
+    return *physical_addr;
+}
 
 void Kernel::copy_frame(uint32_t from_frame, uint32_t to_frame) {
     bool copied = ram().copy(from_frame * mmu::kPageSize, to_frame * mmu::kPageSize, mmu::kPageSize);
@@ -170,21 +209,27 @@ void Kernel::zero_frame(uint32_t frame) {
     }
 }
 
+bool Kernel::write_memory_on_ram(uint32_t addr, std::span<uint8_t> buffer) {
+    for (auto byte : buffer) {
+        std::optional<uint32_t> physical_addr = try_access(page_table(), addr, mmu::Access::store);
+        if (!physical_addr) {
+            return false;
+        }
+        bool wrote = ram().write(*physical_addr, 1, byte);
+        assert(wrote);
+        ++addr;
+    }
+    return true;
+}
+
 std::optional<std::vector<uint8_t>> Kernel::read_memory_on_ram(uint32_t addr, uint32_t bytes_count) {
     std::vector<uint8_t> returned;
-    mem::Ram& ram = machine_.ram();
     while (bytes_count > 0) {
-        std::optional<uint32_t> physical_addr = mmu::translate(page_table(), addr, mmu::Access::load);
+        std::optional<uint32_t> physical_addr = try_access(page_table(), addr, mmu::Access::load);
         if (!physical_addr) {
-            if (!in_region(addr)) {
-                return std::nullopt;
-            }
-            bool created = map_page(mmu::get_vpn(addr));
-            if (!created) return std::nullopt;
-            physical_addr = mmu::translate(page_table(), addr, mmu::Access::load);
-            assert(physical_addr);
+            return std::nullopt;
         }
-        std::optional<uint32_t> readed = ram.read(*physical_addr, 1);
+        std::optional<uint32_t> readed = ram().read(*physical_addr, 1);
         if (!readed) {
             return std::nullopt;
         }

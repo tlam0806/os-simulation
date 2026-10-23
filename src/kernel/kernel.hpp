@@ -24,7 +24,13 @@ struct Switch {
 };
 
 // How a process ended.
-using Ending = std::variant<Exited, Killed>;
+// using Ending = std::variant<Exited, Killed>;
+
+struct Ending {
+    uint32_t parent_pid = 0;
+    std::variant<Exited, Killed> reason;
+    bool collected = false;
+};
 
 // run_all() stopped because every process has ended.
 struct AllDone {
@@ -88,6 +94,9 @@ private :
     std::variant<Exited, Continue, Switch> handle_syscall();
 
     std::optional<std::vector<uint8_t>> read_memory_on_ram(uint32_t addr, uint32_t bytes_count); 
+
+    // return false when theres no frame left on ram or the address is invalid
+    bool write_memory_on_ram(uint32_t addr, std::span<uint8_t> buffer);  
 
     Exited sys_exit(); 
 
@@ -157,9 +166,11 @@ private :
 
     void zero_frame(uint32_t frame);
 
+    std::optional<uint32_t> try_access(mmu::PageTable& table, uint32_t addr, mmu::Access access);
+
     Process& find_next_process(uint32_t last_exec);
 
-    void end_process(Process& process, Ending ending);
+    void end_process(Process& process, std::variant<Exited, Killed> status);
 
     void save_process(Process& process);
     
@@ -169,7 +180,8 @@ private :
     
     uint32_t create_process(Process&& process);
 
-    
+    std::vector<uint32_t> get_running_children_process(uint32_t parent_pid, uint32_t pid);
+    std::vector<uint32_t> get_ended_children_process(uint32_t parent_pid, uint32_t pid);
 };
 
 

@@ -26,6 +26,6 @@ inline Result run_process(machine::Machine& m, const std::vector<uint8_t>& elf, 
     const auto ending = k.ending(pid);
     CHECK(ending.has_value());
     if (!ending) return kernel::StepLimit{};
-    if (const auto* e = std::get_if<kernel::Exited>(&*ending)) return *e;
-    return std::get<kernel::Killed>(*ending);
+    if (const auto* e = std::get_if<kernel::Exited>(&ending->reason)) return *e;
+    return std::get<kernel::Killed>(ending->reason);
 }

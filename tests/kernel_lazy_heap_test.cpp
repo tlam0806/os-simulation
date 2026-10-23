@@ -47,7 +47,7 @@ struct System {
 
     int32_t status(uint32_t pid) {
         const auto e = k.ending(pid);
-        const auto* exited = e ? std::get_if<kernel::Exited>(&*e) : nullptr;
+        const auto* exited = e ? std::get_if<kernel::Exited>(&e->reason) : nullptr;
         CHECK(exited != nullptr);
         return exited ? exited->exit_status : -12345;
     }
@@ -148,7 +148,7 @@ TEST(lazy_heap_past_the_break_page_still_segfaults) {
     const uint32_t pid = s.spawn(a);
     s.run();
     const auto e = s.k.ending(pid);
-    const auto* killed = e ? std::get_if<kernel::Killed>(&*e) : nullptr;
+    const auto* killed = e ? std::get_if<kernel::Killed>(&e->reason) : nullptr;
     CHECK(killed != nullptr);
     if (killed) {
         CHECK_EQ(killed->trap.cause, cpu::Cause::load_page_fault);

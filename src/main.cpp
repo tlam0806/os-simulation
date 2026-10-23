@@ -90,12 +90,12 @@ int run(int argc, char** argv) {
         if (!ending) {
             std::cerr << "did not finish within " << kMaxSteps << " instructions\n";
             all_ok = false;
-        } else if (const auto* exited = std::get_if<kernel::Exited>(&*ending)) {
+        } else if (const auto* exited = std::get_if<kernel::Exited>(&ending->reason)) {
             std::cerr << "exited with status " << exited->exit_status << "\n";
             single_status = exited->exit_status;
             all_ok = all_ok && exited->exit_status == 0;
         } else {
-            std::cerr << "was killed by a trap:\n" << std::get<kernel::Killed>(*ending).trap;
+            std::cerr << "was killed by a trap:\n" << std::get<kernel::Killed>(ending->reason).trap;
             all_ok = false;
         }
     }
