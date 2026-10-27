@@ -24,14 +24,25 @@ std::variant<Killed, Continue> Kernel::handle_page_fault(const cpu::Trap& trap) 
     // the address is valid, inside the region
     uint32_t vpn = mmu::get_vpn(addr);
     std::optional<mmu::Pte> found = page_table().lookup(vpn);
-    if (found) {
-        return Killed{trap};
+
+    if (!found) {
+        // not mapped yet, should create a new one
+        if (!map_page(vpn)) {
+            return Killed{trap};
+        } else {
+            return Continue{};
+        }
     }
-    // not mapped yet, should create a new one
-    if (!map_page(vpn)) {
-        return Killed{trap};
+    assert(found);
+    if (trap.cause == cpu::Cause::store_page_fault && found->cow) { // copy-on-write
+        auto new_pte = handle_cow(*found);
+        if (!new_pte) {
+            return Killed{trap};
+        }
+        page_table().map(vpn, *new_pte);
+        return Continue{};
     }
-    return Continue{};
+    return Killed{trap};
 }
 
 std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Trap& trap) {
@@ -50,23 +61,22 @@ std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Tr
 
 // ---- processes ----
 
-std::optional<mmu::PageTable> Kernel::inherit_table(const mmu::PageTable& other) {
-    mmu::PageTable inherited;
+mmu::PageTable Kernel::share_table(mmu::PageTable& other) {
+    mmu::PageTable shared;
     std::vector<uint32_t> pages = other.mapped_pages();
-    if (pages.size() > frame_allocator().free_count()) {
-        return std::nullopt;
-    }
     for (uint32_t vpn : pages) {
-        std::optional<uint32_t> new_frame = frame_allocator().allocate();
-        assert(new_frame);
         std::optional<mmu::Pte> pte = other.lookup(vpn);
         assert(pte); // should be in the old page table
-        copy_frame(pte->frame, *new_frame);
-        mmu::Pte new_pte = *pte;
-        new_pte.frame = *new_frame;
-        inherited.map(vpn, new_pte);
+        uint32_t frame = pte->frame;
+        frame_allocator().share(frame);
+        if (pte->write) {
+            pte->write = false;
+            pte->cow = true;
+            other.map(vpn, *pte);
+        } 
+        shared.map(vpn, *pte);
     }
-    return inherited;
+    return shared;
 }
 
 std::vector<uint32_t> Kernel::get_running_children_process(uint32_t parent_pid, uint32_t required_pid) {

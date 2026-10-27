@@ -177,7 +177,7 @@ This is everything the hardware holds. A process's CPU context is the first row;
 
 - **User addresses are below `0x80000000`.** The upper half is reserved, so any access to it faults.
 - **Null guard:** `0x00000000`–`0x0000FFFF` is never mapped, so a null-pointer access faults.
-- **Stack:** the initial `sp` is `0x80000000`, which meets the RISC-V ABI's 16-byte alignment rule. The stack region is `0x7FF00000`–`0x7FFFFFFF`. The loader maps the top 16 pages (64 KiB) read+write. The rest of the region is mapped **on demand**: a load or store page fault at an unmapped stack address makes the kernel map a zero-filled read+write page and retry the instruction. A fault anywhere else, a permission fault, or a fault when no frame is free kills the process (a *segmentation fault*).
+- **Stack:** the initial `sp` is `0x80000000`, which meets the RISC-V ABI's 16-byte alignment rule. The stack region is `0x7FF00000`–`0x7FFFFFFF`. The loader maps the top 16 pages (64 KiB) read+write. The rest of the region is mapped **on demand**: a load or store page fault at an unmapped stack address makes the kernel map a zero-filled read+write page and retry the instruction. A fault anywhere else, a permission fault (except a store to a copy-on-write page, see `fork` in B3), or a fault when no frame is free kills the process (a *segmentation fault*).
 - **Heap:** the initial break is the end of the highest loaded segment, rounded up to 4 KiB. It moves with `sbrk` and cannot grow past `0x7FF00000`. Heap pages are mapped **lazily**: `sbrk` only moves the break, and a page from the initial break up to the page holding the last heap byte is mapped (zero-filled, read+write) the first time it is accessed, like the stack. If no frame is free at that moment, the process is killed: a successful `sbrk` does not guarantee memory (*overcommit*).
 - **New pages are always zero-filled**, so a process can never see another process's old data.
 
@@ -208,7 +208,7 @@ The register convention is the same as Linux on RISC-V:
 | `a0`–`a5` (`x10`–`x15`) | Arguments |
 | `a0` | Return value. A negative value is an error code (`-errno`). |
 
-The program executes `ECALL`. The kernel handles the call and resumes the program at `pc + 4`. The kernel changes no registers other than `a0`.
+The program executes `ECALL`. The kernel handles the call and resumes the program at `pc + 4` (except a blocked `wait`, see below). The kernel changes no registers other than `a0`.
 
 The call numbers are our own, not Linux's, because we don't aim to run Linux binaries.
 
@@ -225,19 +225,23 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 
 For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 
-`sbrk` returns `-EINVAL` if the new break would be below the initial break, and `-ENOMEM` if it would be above `0x7FF00000`. Otherwise it always succeeds: it maps nothing (see B1). Shrinking unmaps the heap pages the heap no longer covers and frees their frames.
+`sbrk` returns `-EINVAL` if the new break would be below the initial break, and `-ENOMEM` if it would be above `0x7FF00000`. Otherwise it always succeeds: it maps nothing (see B1). Shrinking unmaps the heap pages the heap no longer covers; each of their frames is freed once no other mapping uses it (see `fork`).
 
 **`fork`** creates a new process, the *child*, as a copy of the caller, the *parent*:
 
-- **Memory:** every page mapped in the parent is copied into a new frame, with the same virtual address and permissions. After `fork`, parent and child never see each other's writes.
+- **Memory (copy-on-write):** the child maps every page the parent has mapped, at the same virtual address and to the **same frame**. A read-only page (code, read-only data) is simply shared. A writable page becomes read-only in *both* processes and is marked *copy-on-write*. After `fork`, parent and child still never see each other's writes:
+  - A store to a copy-on-write page raises a store page fault. If other mappings still use the frame, the kernel copies it into a new frame, maps that read+write for the writer only, and retries the store. If the writer's mapping is the last one, the kernel just makes the page read+write again, with no copy.
+  - If no frame is free for the copy, the writer is killed, like a fault on an untouched heap page (B1).
+  - A kernel write into user memory (for example `wait`'s status) breaks copy-on-write the same way before it writes. If no frame is free, the call returns `-EFAULT`.
+- **Frame reference counts:** each frame in use counts the mappings that point to it. Unmapping a page (`exit`, a kill, a shrinking `sbrk`) decrements the count, and the frame is freed only when the count reaches 0.
 - **Registers and `pc`:** the same in both, so both continue after the `ecall`. Only `a0` differs: the child's pid in the parent, 0 in the child.
 - **Break:** the child starts with the parent's `initial_break` and break, including heap pages that were never touched (they stay valid and unmapped).
 - **pid:** the next unused pid. The child's *parent* is the caller.
-- If there aren't enough free frames to copy every mapped page, `fork` returns `-ENOMEM` and creates nothing.
+- `fork` allocates no frames, so it never fails for lack of memory: running out shows up later, as a kill on the copy-on-write fault (*overcommit*, like the heap).
 
 **`wait`** lets a parent collect a child that has ended:
 
-- It waits for a child of the caller that has ended: the one with pid `a0`, or any child if `a0` is −1. If such a child has already ended, it returns at once. Otherwise the caller is **blocked**: it doesn't run until such a child ends.
+- It waits for a child of the caller that has ended: the one with pid `a0`, or any child if `a0` is −1. If such a child has already ended, it returns at once. Otherwise the caller is **blocked** until such a child ends. For now blocking is a retry: the kernel leaves `pc` on the `ECALL` and switches to another process, so each time the caller is scheduled it runs the `wait` again. The program can't tell the difference, since a `wait` that finds nothing to collect changes nothing.
 - It returns the child's pid. If `a1` isn't 0, it stores the child's status there as a 32-bit word: the exit status if the child called `exit`, or 128 + the trap cause if it was killed. Then the child is forgotten: a second `wait` can't collect it again.
 - If the caller has no child matching `a0` (ended or still running), it returns `-ECHILD` at once.
 - If `a1` isn't 0 and the status can't be stored there (the address isn't 4-byte aligned, like `SW`, or isn't writable by the caller), it returns `-EFAULT` and the child is **not** collected. Like `write`, the kernel maps an untouched heap or stack page first.
@@ -257,7 +261,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 **Rules:**
 
 - An unknown system call number returns `-ENOSYS`. The process is not killed.
-- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. If no frame is free for it, the call returns `-EFAULT`. The `ECALL` is never re-executed, so its side effects can't happen twice.
+- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. If no frame is free for it, the call returns `-EFAULT`. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed call is a blocked `wait`, which had none.
 
 ---
 
@@ -278,7 +282,6 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 
 | Question | Decide by |
 |---|---|
-| What happens when physical RAM runs out: kill the process, or swap? | Milestone 3 |
 | Layout of `argc`/`argv` on the initial stack | Milestone 5 |
 | How `exec` names the program to run (there is no file system yet) | Milestone 5 |
 | Reading input (`read`, stdin) | Later |

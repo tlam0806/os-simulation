@@ -22,6 +22,8 @@ struct Pte {
     bool read = false;    // R: loads allowed
     bool write = false;   // W: stores allowed
     bool exec = false;    // X: instruction fetches allowed
+    bool cow = false;     // copy-on-write: kernel-only mark, the MMU ignores it.
+                          // The page is shared after fork and was writable before.
 
     bool operator==(const Pte&) const = default;
 };

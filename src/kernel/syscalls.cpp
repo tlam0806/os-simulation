@@ -99,12 +99,8 @@ Continue Kernel::sys_fork() {
     copied.parent_pid = executing_pid;
     copied.context = cpu().context();  // update context
     copied.context.regs[isa::reg::a0] = 0; 
-    std::optional<mmu::PageTable> inherited = inherit_table(page_table());
-    if (!inherited) {
-        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnomem));
-        return Continue{};
-    }
-    copied.page_table = *inherited;
+    mmu::PageTable shared = share_table(page_table());
+    copied.page_table = shared;
     uint32_t child_pid = create_process(std::move(copied));
     cpu().set_reg(isa::reg::a0, child_pid);
     return Continue{};
@@ -112,7 +108,6 @@ Continue Kernel::sys_fork() {
 
 std::variant<Continue, Switch> Kernel::sys_wait() {
     int32_t required_pid = static_cast<int32_t>(cpu().reg(isa::reg::a0));
-    // cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEchild));
     std::vector<uint32_t> running = get_running_children_process(executing_pid, static_cast<uint32_t>(required_pid));
     std::vector<uint32_t> ended = get_ended_children_process(executing_pid, static_cast<uint32_t>(required_pid));
     if (running.empty() && ended.empty()) {
@@ -127,7 +122,6 @@ std::variant<Continue, Switch> Kernel::sys_wait() {
         int32_t end_status = std::holds_alternative<Exited>(end.reason) 
             ? std::get<Exited>(end.reason).exit_status 
             : static_cast<int32_t>(std::get<Killed>(end.reason).trap.cause) + 128;
-        // cpu().set_reg(isa::reg::a1, end_status);
         uint32_t addr = cpu().reg(isa::reg::a1);
         if (addr == 0) {
             end.collected = true;
@@ -153,7 +147,7 @@ std::variant<Continue, Switch> Kernel::sys_wait() {
 }
 
 Continue Kernel::sys_exec() {
-
+    return Continue{};
 }
 
 Continue Kernel::sys_other() {
@@ -163,6 +157,23 @@ Continue Kernel::sys_other() {
 
 // ---- memory helpers ----
 
+std::optional<mmu::Pte> Kernel::handle_cow(mmu::Pte pte) {
+    assert(pte.cow == true);
+    assert(pte.write == false);
+    if (frame_allocator().ref_count(pte.frame) > 1) {
+        std::optional<uint32_t> new_frame = frame_allocator().allocate();
+        if (!new_frame) {
+            return std::nullopt;
+        }
+        copy_frame(pte.frame, *new_frame);
+        frame_allocator().free(pte.frame);
+        pte.frame = *new_frame;
+    }   
+    pte.cow = false;
+    pte.write = true;
+    return pte;
+}
+
 std::optional<uint32_t> Kernel::try_access(mmu::PageTable& table, uint32_t addr, mmu::Access access) {
     std::optional<uint32_t> physical_addr = mmu::translate(table, addr, access);
     if (physical_addr) {
@@ -171,11 +182,23 @@ std::optional<uint32_t> Kernel::try_access(mmu::PageTable& table, uint32_t addr,
     if (!in_region(addr)) {
         return std::nullopt;
     }
-    bool created = map_page(mmu::get_vpn(addr));
+    uint32_t vpn = mmu::get_vpn(addr);
+    std::optional<mmu::Pte> found = table.lookup(vpn);
+    if (found && found->cow && access == mmu::Access::store) { // copy-on-write
+        auto new_pte = handle_cow(*found);
+        if (!new_pte) {
+            return std::nullopt;
+        }
+        table.map(vpn, *new_pte);
+        physical_addr = mmu::translate(table, addr, access);
+        assert(physical_addr);
+        return *physical_addr;
+    }
+    bool created = map_page(vpn);
     if (!created) {
         return std::nullopt;
     }
-    physical_addr = mmu::translate(table, addr, mmu::Access::load);
+    physical_addr = mmu::translate(table, addr, access);
     assert(physical_addr);
     return *physical_addr;
 }

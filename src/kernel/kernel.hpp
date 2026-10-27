@@ -145,7 +145,7 @@ private :
         return process.page_table;
     }
 
-    std::optional<mmu::PageTable> inherit_table(const mmu::PageTable& other); // null if theres not enough frame to allocate
+    mmu::PageTable share_table(mmu::PageTable& other);
 
     void copy_frame(uint32_t old_frame, uint32_t new_frame);
 
@@ -179,6 +179,8 @@ private :
     uint64_t run_helper(uint64_t max_step);
     
     uint32_t create_process(Process&& process);
+
+    std::optional<mmu::Pte> handle_cow(mmu::Pte pte);
 
     std::vector<uint32_t> get_running_children_process(uint32_t parent_pid, uint32_t pid);
     std::vector<uint32_t> get_ended_children_process(uint32_t parent_pid, uint32_t pid);
