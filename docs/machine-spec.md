@@ -4,7 +4,7 @@
 
 This document defines the simulated machine: the "hardware" that user programs run on, and the rules the kernel can rely on. The kernel itself is ordinary C++ code inside the simulator. Only user programs run on the simulated CPU.
 
-- **Part A** describes the hardware: CPU, memory, traps, timer.
+- **Part A** describes the hardware: CPU, memory, traps, timer, disk.
 - **Part B** describes the conventions between user programs and the kernel: address space layout, program loading, system calls.
 
 Instruction behavior follows the [RISC-V Unprivileged ISA Specification](https://github.com/riscv/riscv-isa-manual/releases). This document only records the choices RISC-V leaves open and the places where we simplify.
@@ -15,6 +15,7 @@ Instruction behavior follows the [RISC-V Unprivileged ISA Specification](https:/
 2. **Deterministic.** The same program with the same input always runs the same way. Time is counted in CPU steps, not wall-clock time, so every bug is reproducible.
 3. **Precise traps.** An instruction that traps has no effect, so the kernel can fix the cause and run it again.
 4. **Real toolchain.** User programs are written in C and compiled with standard clang (see Appendix).
+5. **Real units, one scale.** One step is **1 µs** of simulated time: the CPU runs at 1 MIPS. Every size and time in this document is stated in real units under that single rule, so it can be checked against real hardware. Format sizes (512-byte sector, 4 KiB page) are not scaled. Capacities keep real ratios: the disk is 64 × RAM.
 
 ---
 
@@ -95,7 +96,7 @@ Translation of an address `vaddr` for an access (fetch, load or store):
 
 ## A3. Traps
 
-A **trap** stops the CPU and hands control to the kernel. An *exception* is caused by the current instruction. An *interrupt* comes from outside it; for now, the timer is the only source.
+A **trap** stops the CPU and hands control to the kernel. An *exception* is caused by the current instruction. An *interrupt* comes from outside it: the timer (A4) or the disk (A6).
 
 Cause codes are the same as RISC-V's, so RISC-V documentation stays useful as a reference.
 
@@ -111,6 +112,9 @@ Cause codes are the same as RISC-V's, so RISC-V documentation stays useful as a 
 | 13 | Load page fault | Load from a page that is unmapped or not R | Address |
 | 15 | Store page fault | Store to a page that is unmapped or not W | Address |
 | Interrupt 5 | Timer interrupt | Clock has reached the timer deadline (A4) | 0 |
+| Interrupt 9 | Disk interrupt | The disk has finished a request (A6) | 0 |
+
+If both interrupts are pending, the disk interrupt is raised first (as in RISC-V, external interrupts come before the timer).
 
 On a trap, the CPU gives the kernel a **trap record**:
 
@@ -135,7 +139,8 @@ Kernel code is C++ and always runs to completion. It is never interrupted, so th
 
 - The machine keeps a 64-bit **clock** that goes up by 1 for every instruction the CPU attempts, including one that ends in an exception. Kernel code takes zero simulated time.
 - The kernel sets a 64-bit **timer deadline** (like RISC-V's `mtimecmp`). Before each instruction, if `clock >= deadline`, the CPU raises a timer interrupt instead of running the instruction. Taking the interrupt does not advance the clock.
-- The interrupt keeps firing until the kernel moves the deadline forward, for example `deadline = clock + quantum`. The starting quantum is 1000.
+- The interrupt keeps firing until the kernel moves the deadline forward, for example `deadline = clock + quantum`. The starting quantum is 1000 (1 ms).
+- **Idle.** When no process can run (all are blocked, e.g. on the disk), the kernel tells the machine to **wait for an interrupt** (like RISC-V's `WFI`). The clock jumps straight to the next pending interrupt, timer or disk, and that interrupt is raised. Idle time counts as clock time but runs no instruction. With no interrupt pending, waiting would never end: that is a kernel bug.
 
 ## A5. Machine state summary
 
@@ -147,6 +152,64 @@ This is everything the hardware holds. A process's CPU context is the first row;
 | Physical RAM | 1 MiB |
 | Current address space | Set by the kernel |
 | Clock, timer deadline | 64 bits each |
+| Disk contents | 64 MiB (A6) |
+| Disk head track, current request | A6 |
+
+## A6. Disk
+
+A single magnetic hard disk, modelled on CS2106 L11: a 1-D array of sectors to the OS, with real seek, rotation and transfer times underneath.
+
+| Property | Value |
+|---|---|
+| Sector size | 512 bytes. The smallest unit the disk reads or writes. |
+| Geometry | 128 tracks × 1024 sectors per track, one surface, one head |
+| Capacity | 131072 sectors = 64 MiB (64 × RAM) |
+| Rotation | One turn every 8192 µs (~7300 RPM). A sector passes under the head in 8 µs. |
+| Seek | 0 on the same track; otherwise 1000 µs + 50 µs per track crossed (1.05–7.35 ms) |
+| Transfer | 8 µs per sector, i.e. the time it takes to pass under the head (64 MB/s) |
+| Contents at power-on | All zeros |
+| Head at power-on | Track 0 |
+
+### Addressing
+
+The kernel names sectors by **logical sector number** `s`, from 0 to 131071. The disk maps it to a place on the surface:
+
+- track `s / 1024`, sector `s % 1024` within that track.
+
+So consecutive sectors lie one after another along a track, then continue on the next track.
+
+### Rotation
+
+The platter turns with the clock and never stops. At clock time `t`, sector `(t / 8) % 1024` of the current track is starting to pass under the head. The disk can start transferring sector `k` only when its start reaches the head.
+
+### Requests
+
+The disk does one request at a time; keeping a queue and choosing the order is the kernel's job (disk scheduling, L11). A request is:
+
+- **operation:** read or write
+- **first sector** `s` and **count** `n ≥ 1`
+- **RAM address:** the physical address of `n × 512` bytes in RAM. The disk copies data between itself and RAM directly (*DMA*); the CPU is not involved.
+
+The kernel **submits** a request when the disk is idle. The disk refuses a request, and does nothing, if it is busy, if `n` is 0, if the sectors run past the end of the disk, or if the RAM range runs past the end of RAM. Refusing is not an interrupt; the kernel sees it at once.
+
+### Timing
+
+A request submitted at clock time `t₀` with the head on track `H` takes:
+
+1. **Seek** to the track of sector `s`: 0 if it is `H`, else `1000 + 50 × |track − H|` µs.
+2. **Rotational latency:** wait until the start of sector `s` reaches the head (0 to 8184 µs).
+3. **Transfer:** 8 µs per sector, while the sectors pass under the head.
+4. If the request runs past the end of a track, the head moves to the next track (a 1-track seek, 1050 µs), waits for sector 0 of that track, and goes on transferring. Repeat until all `n` sectors are done.
+
+The request **completes** at the end of the last transfer. At that moment the data moves (read: disk → RAM; write: RAM → disk), the head stays on the last track used, the disk becomes idle, and a **disk interrupt** is raised (A3). The interrupt keeps firing until the kernel acknowledges it.
+
+While the request is in progress, the kernel must not touch the RAM range: what it would see there is not defined.
+
+Example, matching the lecture's formula *seek + rotational latency + transfer*: the head is on track 0 at `t₀ = 0`, and the kernel reads 8 sectors (one page) starting at sector `s = 2·1024 + 100` (track 2, sector 100). Seek: 1000 + 50 × 2 = 1100 µs, so the head arrives at `t = 1100`. Sector `(1100 / 8) % 1024 = 137` is passing, so it waits for sector 100 to come round again: it starts at `t = 8192 + 800 = 8992`. Transfer: 8 × 8 = 64 µs. The request completes at `t = 9056`.
+
+### Host access
+
+Outside the simulated machine, the simulator (and tests) can read and write the disk contents directly, with no timing and no interrupt: for example, to fill the disk with an image before the machine runs. Programs and the kernel never use this.
 
 ---
 
@@ -274,7 +337,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 ## Not in scope (for now)
 
 - Multiple CPUs, caches, TLB
-- Devices, disks, and interrupts other than the timer
+- Devices other than the one disk (no second disk, no keyboard or screen device)
 - Floating-point, atomic, compressed and CSR instructions
 - Hardware support for misaligned access
 

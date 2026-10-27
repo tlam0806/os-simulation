@@ -36,6 +36,7 @@ add_library(ossim_core
   src/kernel/syscalls.cpp
   src/mmu/page_table.cpp
   src/mmu/frame_allocator.cpp
+  src/disk/disk.cpp
 )
 target_include_directories(ossim_core PUBLIC src)
 target_link_libraries(ossim_core PUBLIC ossim_options)
@@ -71,6 +72,7 @@ add_executable(ossim_tests
   tests/kernel_lazy_heap_test.cpp
   tests/kernel_fork_test.cpp
   tests/kernel_wait_test.cpp
+  tests/disk_test.cpp
 )
 target_link_libraries(ossim_tests PRIVATE ossim_core)
 add_test(NAME ossim_tests COMMAND ossim_tests)

@@ -4,6 +4,7 @@
 #include <optional>
 #include <cstdint>
 #include <cassert>
+#include <span>
 
 namespace mem {
 
@@ -24,6 +25,32 @@ public :
         return returned;
     }
 
+    std::optional<std::vector<uint8_t>> read_bytes(uint32_t starting_addr, uint32_t size) const noexcept {
+        uint64_t max_reach = static_cast<uint64_t>(starting_addr) + static_cast<uint64_t>(size);
+        if (max_reach > static_cast<uint64_t>(memory.size())) {
+            return std::nullopt;
+        }
+        std::vector<uint8_t> returned;
+        returned.reserve(size);
+        for (std::size_t i = 0; i < size; ++i) {
+            uint32_t addr = starting_addr + i;
+            returned.push_back(memory[addr]);
+        }
+        return returned;
+    }
+
+    bool write_bytes(uint32_t starting_addr, std::span<uint8_t> bytes) noexcept {
+        uint64_t max_reach = static_cast<uint64_t>(starting_addr) + static_cast<uint64_t>(bytes.size());
+        if (max_reach > static_cast<uint64_t>(memory.size())) {
+            return false;
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i) {
+            uint32_t addr = starting_addr + i;
+            memory[addr] = bytes[i];
+        }
+        return true;
+    }
+
     bool write(uint32_t starting_addr, uint8_t size, uint32_t value) noexcept {
         assert(size == 1 || size == 2 || size == 4);
         if (starting_addr > memory.size() - size) {
@@ -36,9 +63,11 @@ public :
         return true;
     }   
 
+    
+
     bool copy(uint32_t from, uint32_t to, uint32_t size) {
         // [from, from + size) should not overlap with [to, to + size), otherwise it is UB
-        uint64_t max_reach = static_cast<uint64_t>(std::max(from, to) + size);
+        uint64_t max_reach = static_cast<uint64_t>(std::max(from, to)) + static_cast<uint64_t>(size);
         if (max_reach > static_cast<uint64_t>(memory.size())) {
             return false;
         }
