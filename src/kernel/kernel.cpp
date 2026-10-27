@@ -129,12 +129,16 @@ size_t Kernel::process_count() const {
 
 Process& Kernel::find_next_process(uint32_t last_exec) {
     assert(process_count());
-    auto it = process_table_.upper_bound(last_exec);
-    if (it == process_table_.end()) {
-        it = process_table_.begin();
+    while (true) {
+        auto it = process_table_.upper_bound(last_exec);
+        if (it == process_table_.end()) {
+            it = process_table_.begin();
+        }
+        if (!it->second.blocked) {
+            return it->second;
+        }
+        last_exec = it->first;
     }
-    assert(it != process_table_.end());
-    return it->second;
 }
 
 void Kernel::end_process(Process& process, std::variant<Exited, Killed> status) {
@@ -154,7 +158,11 @@ void Kernel::end_process(Process& process, std::variant<Exited, Killed> status) 
         uint32_t frame = process.page_table.lookup(vpn)->frame;
         frame_allocator().free(frame);
     }
-
+    // the parent is no longer blocked
+    auto parent_it = process_table_.find(process.parent_pid);
+    if (parent_it != process_table_.end()) {
+        parent_it->second.blocked = false;
+    }
     process_table_.erase(process.pid); // should be last, because process is deleted
 }
 

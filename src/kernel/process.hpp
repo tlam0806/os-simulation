@@ -17,6 +17,7 @@ struct Process {
     mmu::PageTable page_table;   // its own address space (spec A2, B1)
     uint32_t initial_break = 0;  // start of its heap; sbrk can't go below this
     uint32_t brk = 0;            // current end of its heap
+    bool blocked = false;        // in wait with no ended child yet: the scheduler skips it
 };
 
 }  // namespace kernel

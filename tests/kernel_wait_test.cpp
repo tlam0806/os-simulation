@@ -430,3 +430,161 @@ TEST(wait_blocks_others_keep_running) {
     s.run();
     CHECK_EQ(s.out.str(), std::string("X"));
 }
+
+// =================== 5.6: real blocking (the caller sleeps) ===================
+// A wait with nothing to collect marks the caller blocked: the scheduler skips
+// it and it runs no instructions. The end of a matching child (exit or kill)
+// makes it runnable; then its wait runs again and collects that child.
+
+namespace {
+
+// Parent forks and waits for any child; the child busy-waits, then exits 0.
+// Returns how many instructions the whole run took.
+uint64_t steps_with_busy_child(int32_t iterations) {
+    System s;
+    Asm a;
+    const size_t to_child = fork_and_branch_to_child(a);
+    wait_into_s1_s2(a, -1);
+    a.exit_with(0);
+    a.patch(to_child, a.here());
+    a.busy_wait(iterations);
+    a.exit_with(0);
+    s.spawn(a);
+    s.run();
+    return s.m.steps();
+}
+
+}  // namespace
+
+TEST(wait_sleeps_parent_is_blocked_while_child_runs) {
+    System s;
+    Asm a;
+    const size_t to_child = fork_and_branch_to_child(a);
+    wait_into_s1_s2(a, -1);
+    a.exit_with(0);
+    a.patch(to_child, a.here());
+    a.emit({JAL, zero, 0, 0, 0});         // child loops forever
+    s.spawn(a);
+    CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(5000)));
+    const kernel::Process* parent = s.k.process(1);
+    const kernel::Process* child = s.k.process(2);
+    CHECK(parent != nullptr && child != nullptr);
+    if (!parent || !child) return;
+    CHECK(parent->blocked);
+    CHECK(!child->blocked);
+}
+
+TEST(wait_sleeps_blocked_parent_runs_no_instructions) {
+    // The child's loop is 2 instructions per iteration. Making it 4000
+    // iterations longer must cost exactly 8000 more instructions: a blocked
+    // parent adds none, however many turns the child takes.
+    const uint64_t short_run = steps_with_busy_child(3000);
+    const uint64_t long_run = steps_with_busy_child(7000);
+    CHECK_EQ(long_run - short_run, 8000u);
+}
+
+TEST(wait_sleeps_child_exit_makes_parent_runnable) {
+    // After the child exits, the parent collects it and loops: not blocked.
+    System s;
+    Asm a;
+    const size_t to_child = fork_and_branch_to_child(a);
+    wait_into_s1_s2(a, -1);
+    a.emit({JAL, zero, 0, 0, 0});         // parent loops after its wait
+    a.patch(to_child, a.here());
+    a.busy_wait(1500);
+    a.exit_with(0);
+    s.spawn(a);
+    CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(20000)));
+    const kernel::Process* parent = s.k.process(1);
+    CHECK(parent != nullptr);
+    if (!parent) return;
+    CHECK(!parent->blocked);
+    const auto ending = s.k.ending(2);
+    CHECK(ending.has_value() && ending->collected);
+}
+
+TEST(wait_sleeps_other_child_does_not_wake) {
+    // The parent waits for pid 3, which loops forever. pid 2 exiting must not
+    // wake it.
+    System s;
+    Asm a;
+    const size_t to_two = fork_and_branch_to_child(a);
+    const size_t to_three = fork_and_branch_to_child(a);
+    wait_into_s1_s2(a, 3);
+    a.exit_with(0);
+    a.patch(to_two, a.here());
+    a.exit_with(0);                       // pid 2 ends at once
+    a.patch(to_three, a.here());
+    a.emit({JAL, zero, 0, 0, 0});         // pid 3 never ends
+    s.spawn(a);
+    CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(5000)));
+    CHECK(s.k.ending(2).has_value());
+    const kernel::Process* parent = s.k.process(1);
+    CHECK(parent != nullptr);
+    if (parent) CHECK(parent->blocked);
+}
+
+TEST(wait_sleeps_grandchild_end_does_not_wake) {
+    // pid 1 waits for its child pid 2, which loops. pid 2's own child (pid 3)
+    // exits: that is not pid 1's child, so pid 1 stays blocked.
+    System s;
+    Asm a;
+    const size_t to_child = fork_and_branch_to_child(a);
+    wait_into_s1_s2(a, -1);
+    a.exit_with(0);
+    a.patch(to_child, a.here());
+    const size_t to_grandchild = fork_and_branch_to_child(a);
+    a.emit({JAL, zero, 0, 0, 0});         // pid 2 loops
+    a.patch(to_grandchild, a.here());
+    a.exit_with(0);                       // pid 3 ends
+    s.spawn(a);
+    CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(5000)));
+    CHECK(s.k.ending(3).has_value());
+    const kernel::Process* parent = s.k.process(1);
+    CHECK(parent != nullptr);
+    if (parent) CHECK(parent->blocked);
+}
+
+TEST(wait_sleeps_killed_child_wakes_parent) {
+    // The child is killed by a store to the code page (store page fault, 15)
+    // while the parent sleeps: status 128 + 15.
+    System s;
+    Asm a;
+    const size_t to_child = fork_and_branch_to_child(a);
+    wait_into_s1_s2(a, -1);
+    exit_with_s1_and_s2(a);               // 2 * 1000 + 143
+    a.patch(to_child, a.here());
+    a.busy_wait(1500);                    // the parent is asleep by now
+    a.li(t0, 0x10000);
+    a.emit({SW, 0, t0, zero, 0});
+    a.exit_with(0);
+    const uint32_t parent = s.spawn(a);
+    s.run();
+    CHECK_EQ(s.status(parent), 2143);
+}
+
+TEST(wait_sleeps_wakeup_with_bad_address_is_efault) {
+    // The parent sleeps in wait(-1, code page). When the child ends, the retried
+    // wait can't store: -EFAULT, child not collected. A second wait gets it.
+    System s;
+    Asm a;
+    const size_t to_child = fork_and_branch_to_child(a);
+    a.li(a0, -1);
+    a.li(a1, 0x10000);
+    a.syscall(SYS_WAIT);
+    a.emit({ADDI, s3, a0, 0, 0});         // -EFAULT
+    wait_into_s1_s2(a, -1);               // s1 = 2, s2 = 9
+    a.li(t0, -10000);
+    a.emit({MUL, a0, s3, t0, 0});
+    a.li(t0, 1000);
+    a.emit({MUL, t1, s1, t0, 0});
+    a.emit({ADD, a0, a0, t1, 0});
+    a.emit({ADD, a0, a0, s2, 0});
+    a.exit_with_a0();
+    a.patch(to_child, a.here());
+    a.busy_wait(1500);
+    a.exit_with(9);
+    const uint32_t parent = s.spawn(a);
+    s.run();
+    CHECK_EQ(s.status(parent), kEfault * 10000 + 2009);
+}

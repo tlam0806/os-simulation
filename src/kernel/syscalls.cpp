@@ -132,7 +132,7 @@ std::variant<Continue, Switch> Kernel::sys_wait() {
             cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
             return Continue{};
         }
-        auto physical_addr = try_access(page_table(), addr, mmu::Access::store);
+        auto physical_addr = try_access(addr, mmu::Access::store);
         if (!physical_addr) {
             cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
             return Continue{};
@@ -142,6 +142,7 @@ std::variant<Continue, Switch> Kernel::sys_wait() {
         cpu().set_reg(isa::reg::a0, pid);
         return Continue{};
     } 
+    process().blocked = true;
     cpu().pc -= 4;
     return Switch{};
 }
@@ -174,8 +175,8 @@ std::optional<mmu::Pte> Kernel::handle_cow(mmu::Pte pte) {
     return pte;
 }
 
-std::optional<uint32_t> Kernel::try_access(mmu::PageTable& table, uint32_t addr, mmu::Access access) {
-    std::optional<uint32_t> physical_addr = mmu::translate(table, addr, access);
+std::optional<uint32_t> Kernel::try_access(uint32_t addr, mmu::Access access) {
+    std::optional<uint32_t> physical_addr = mmu::translate(page_table(), addr, access);
     if (physical_addr) {
         return *physical_addr;
     }
@@ -183,14 +184,14 @@ std::optional<uint32_t> Kernel::try_access(mmu::PageTable& table, uint32_t addr,
         return std::nullopt;
     }
     uint32_t vpn = mmu::get_vpn(addr);
-    std::optional<mmu::Pte> found = table.lookup(vpn);
+    std::optional<mmu::Pte> found = page_table().lookup(vpn);
     if (found && found->cow && access == mmu::Access::store) { // copy-on-write
         auto new_pte = handle_cow(*found);
         if (!new_pte) {
             return std::nullopt;
         }
-        table.map(vpn, *new_pte);
-        physical_addr = mmu::translate(table, addr, access);
+        page_table().map(vpn, *new_pte);
+        physical_addr = mmu::translate(page_table(), addr, access);
         assert(physical_addr);
         return *physical_addr;
     }
@@ -198,7 +199,7 @@ std::optional<uint32_t> Kernel::try_access(mmu::PageTable& table, uint32_t addr,
     if (!created) {
         return std::nullopt;
     }
-    physical_addr = mmu::translate(table, addr, access);
+    physical_addr = mmu::translate(page_table(), addr, access);
     assert(physical_addr);
     return *physical_addr;
 }
@@ -234,7 +235,7 @@ void Kernel::zero_frame(uint32_t frame) {
 
 bool Kernel::write_memory_on_ram(uint32_t addr, std::span<uint8_t> buffer) {
     for (auto byte : buffer) {
-        std::optional<uint32_t> physical_addr = try_access(page_table(), addr, mmu::Access::store);
+        std::optional<uint32_t> physical_addr = try_access(addr, mmu::Access::store);
         if (!physical_addr) {
             return false;
         }
@@ -248,7 +249,7 @@ bool Kernel::write_memory_on_ram(uint32_t addr, std::span<uint8_t> buffer) {
 std::optional<std::vector<uint8_t>> Kernel::read_memory_on_ram(uint32_t addr, uint32_t bytes_count) {
     std::vector<uint8_t> returned;
     while (bytes_count > 0) {
-        std::optional<uint32_t> physical_addr = try_access(page_table(), addr, mmu::Access::load);
+        std::optional<uint32_t> physical_addr = try_access(addr, mmu::Access::load);
         if (!physical_addr) {
             return std::nullopt;
         }

@@ -72,6 +72,8 @@ public :
     //   - A process ends when it calls exit or a trap kills it. The kernel
     //     records how it ended (see ending()), frees all its frames, removes it
     //     from the table, and continues with the next process.
+    //   - A blocked process (Process::blocked, a wait with nothing to collect yet)
+    //     is skipped. The end of a child it waits for makes it runnable again.
     //   - System calls act on the process that made them: its memory and its break.
     //   - After StepLimit, calling run_all() again continues where it stopped.
     std::variant<AllDone, StepLimit> run_all(uint64_t max_steps);
@@ -166,7 +168,7 @@ private :
 
     void zero_frame(uint32_t frame);
 
-    std::optional<uint32_t> try_access(mmu::PageTable& table, uint32_t addr, mmu::Access access);
+    std::optional<uint32_t> try_access(uint32_t addr, mmu::Access access);
 
     Process& find_next_process(uint32_t last_exec);
 
