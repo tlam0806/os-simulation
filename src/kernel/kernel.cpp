@@ -45,10 +45,31 @@ std::variant<Killed, Continue> Kernel::handle_page_fault(const cpu::Trap& trap) 
     return Killed{trap};
 }
 
+Continue Kernel::handle_disk_interrupt() {
+    assert(pending_ios_.size());
+    if (pending_ios_.empty()) {
+        return Continue{};
+    }
+    const PendingIO& next = pending_ios_.front();
+    machine_.acknowledge_disk_interrupt();
+    kernel::Process& process = process_table_.find(next.pid)->second;
+    assert(process.blocked == kernel::BlockReason::IO);
+    process.blocked = kernel::BlockReason::None;
+    process.context.regs[isa::reg::a0] = 0; // return value for disk_read/disk_write
+    assert(disk().busy() == false);
+    pending_ios_.pop();
+    if (pending_ios_.size()) {
+        start_next_request();
+    }
+    return Continue{};
+}
+
 std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Trap& trap) {
     switch (trap.cause) {
         case cpu::Cause::ecall :
             return util::convert_variant<Exited, Killed, Continue, Switch>(handle_syscall());
+        case cpu::Cause::disk_interrupt :
+            return handle_disk_interrupt();        
         case cpu::Cause::timer_interrupt :
             return Switch{};
         case cpu::Cause::load_page_fault :
@@ -127,18 +148,22 @@ size_t Kernel::process_count() const {
     return process_table_.size();
 }
 
-Process& Kernel::find_next_process(uint32_t last_exec) {
+Process* Kernel::find_next_process(uint32_t last_exec) {
     assert(process_count());
-    while (true) {
-        auto it = process_table_.upper_bound(last_exec);
+    uint32_t cur_pid = last_exec;
+    uint32_t process_count = process_table_.size();
+    while (process_count--) {
+        auto it = process_table_.upper_bound(cur_pid);
         if (it == process_table_.end()) {
             it = process_table_.begin();
         }
-        if (!it->second.blocked) {
-            return it->second;
+        if (it->second.blocked == BlockReason::None) {
+            return std::addressof(it->second);
         }
-        last_exec = it->first;
-    }
+        cur_pid = it->first;
+    } 
+    // no process is runnable
+    return nullptr;
 }
 
 void Kernel::end_process(Process& process, std::variant<Exited, Killed> status) {
@@ -161,7 +186,9 @@ void Kernel::end_process(Process& process, std::variant<Exited, Killed> status) 
     // the parent is no longer blocked
     auto parent_it = process_table_.find(process.parent_pid);
     if (parent_it != process_table_.end()) {
-        parent_it->second.blocked = false;
+        if (parent_it->second.blocked == kernel::BlockReason::Wait) {
+            parent_it->second.blocked = kernel::BlockReason::None;
+        }
     }
     process_table_.erase(process.pid); // should be last, because process is deleted
 }
@@ -189,7 +216,23 @@ void Kernel::load_process(Process& process) {
 
 // Runs the next process for one turn; returns how many of max_steps are left.
 uint64_t Kernel::run_helper(uint64_t max_steps) {
-    Process& process = find_next_process(executing_pid);
+    Process* maybe_process = find_next_process(executing_pid);
+    if (!maybe_process) { // every process is blocked: wait for an interrupt
+        uint64_t old_steps = machine_.steps();
+        machine_.set_timer(machine_.steps() + max_steps);
+        auto trap = machine_.wait_for_interrupt();
+        uint64_t taken_steps = machine_.steps() - old_steps;
+        assert(taken_steps <= max_steps);
+        max_steps -= taken_steps;
+        if (!trap) { // no interrupt is ever due
+            return max_steps;
+        }
+        if (trap->cause == cpu::Cause::disk_interrupt) {
+            handle_disk_interrupt();
+        }
+        return max_steps;
+    }
+    Process& process = *maybe_process;
     load_process(process);
     machine_.set_timer(machine_.steps() + kQuantum);
     // repeatedly run the process

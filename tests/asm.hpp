@@ -9,7 +9,8 @@
 
 // System call numbers (spec B3).
 inline constexpr int32_t SYS_EXIT = 1, SYS_WRITE = 2, SYS_SBRK = 3, SYS_GETPID = 4, SYS_YIELD = 5,
-                         SYS_FORK = 6, SYS_EXEC = 7, SYS_WAIT = 8;
+                         SYS_FORK = 6, SYS_EXEC = 7, SYS_WAIT = 8,
+                         SYS_DISK_READ = 9, SYS_DISK_WRITE = 10;
 
 struct Asm {
     using enum isa::Op;

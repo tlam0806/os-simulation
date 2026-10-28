@@ -15,6 +15,8 @@ inline constexpr uint32_t kSysYield = 5;
 inline constexpr uint32_t kSysFork = 6;
 inline constexpr uint32_t kSysExec = 7;   // not defined yet
 inline constexpr uint32_t kSysWait = 8;
+inline constexpr uint32_t kSysDiskRead = 9;
+inline constexpr uint32_t kSysDiskWrite = 10;
 
 // Error codes, using Linux's values. A failed call returns -code in a0.
 // (Not EBADF etc.: those names are macros in <errno.h>.)

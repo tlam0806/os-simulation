@@ -26,9 +26,21 @@ std::variant<Exited, Continue, Switch> Kernel::handle_syscall() {
             return sys_fork();
         case abi::kSysWait :
             return util::convert_variant<Exited, Continue, Switch>(sys_wait());
+        case abi::kSysDiskRead :
+            return util::convert_variant<Exited, Continue, Switch>(sys_disk_read());
+        case abi::kSysDiskWrite :
+            return util::convert_variant<Exited, Continue, Switch>(sys_disk_write());
         default :
             return sys_other();
     }
+}
+
+std::variant<Continue, Switch> Kernel::sys_disk_read() {
+    return disk_io(disk::Op::read);
+}
+
+std::variant<Continue, Switch> Kernel::sys_disk_write() {
+    return disk_io(disk::Op::write);
 }
 
 Exited Kernel::sys_exit() {
@@ -142,7 +154,7 @@ std::variant<Continue, Switch> Kernel::sys_wait() {
         cpu().set_reg(isa::reg::a0, pid);
         return Continue{};
     } 
-    process().blocked = true;
+    process().blocked = kernel::BlockReason::Wait;
     cpu().pc -= 4;
     return Switch{};
 }
@@ -157,6 +169,49 @@ Continue Kernel::sys_other() {
 }
 
 // ---- memory helpers ----
+
+void Kernel::start_next_request() {
+    assert(!disk().busy());
+    const PendingIO& next = pending_ios_.front();
+    bool submitted = disk().submit(next.request, machine_.steps());
+    assert(submitted);
+}
+
+std::variant<Continue, Switch> Kernel::disk_io(disk::Op op) {
+    uint32_t sector = cpu().reg(isa::reg::a0);
+    uint32_t buffer_addr = cpu().reg(isa::reg::a1);
+    uint32_t count = cpu().reg(isa::reg::a2);
+    if (count == 0) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
+        return Continue{};
+    }
+    if (static_cast<uint64_t>(sector) + static_cast<uint64_t>(count) > static_cast<uint64_t>(disk::kNumSectors)) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
+        return Continue{};
+    }
+    uint64_t last = static_cast<uint64_t>(buffer_addr) + static_cast<uint64_t>(count) * disk::kSectorSize - 1;
+    if (last > UINT32_MAX) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
+        return Continue{};
+    }
+    if (mmu::get_vpn(buffer_addr) != mmu::get_vpn(static_cast<uint32_t>(last))) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
+        return Continue{};
+    }
+    mmu::Access access = (op == disk::Op::read ? mmu::Access::store : mmu::Access::load);
+    auto physical_addr = try_access(buffer_addr, access);
+    if (!physical_addr) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
+        return Continue{};
+    }
+    cpu().set_reg(isa::reg::a0, 0);
+    pending_ios_.push(PendingIO{executing_pid, disk::Request{op, sector, count, *physical_addr}});
+    process().blocked = kernel::BlockReason::IO;
+    if (!disk().busy()) {
+        start_next_request();
+    }
+    return Switch{};
+}
 
 std::optional<mmu::Pte> Kernel::handle_cow(mmu::Pte pte) {
     assert(pte.cow == true);

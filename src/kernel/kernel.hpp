@@ -4,6 +4,7 @@
 #include <variant>
 #include <map>
 #include <optional>
+#include <queue>
 #include "kernel/process.hpp"
 #include "machine/machine.hpp"
 namespace kernel {
@@ -41,12 +42,16 @@ inline constexpr uint64_t kQuantum = 1000;
 
 class Kernel {
 public :
+    struct PendingIO {
+        uint32_t pid;
+        disk::Request request;
+    };
+
     Kernel(machine::Machine& machine, std::ostream& out, std::ostream& err) : 
         machine_{machine},
         out_{out},
         err_{err}
-    {}
-    
+    {}    
 
     // Creates a new process from an ELF file (spec B2): its own page table,
     // built by the loader with frames from the machine's frame allocator, and
@@ -64,16 +69,21 @@ public :
     size_t process_count() const;
 
     // Runs all processes in the table, taking turns (round robin, in pid order),
-    // until every process has ended (AllDone) or max_steps instructions have
-    // run in this call, counted across all processes (StepLimit).
+    // until every process has ended (AllDone) or the clock has advanced by
+    // max_steps in this call (StepLimit). That counts instructions of all
+    // processes and idle time (all blocked: the machine waits for an interrupt).
     //   - Each turn lasts at most kQuantum instructions: the machine timer
     //     interrupts the process, the kernel saves its context and moves on to
     //     the next pid (wrapping around to the lowest).
     //   - A process ends when it calls exit or a trap kills it. The kernel
     //     records how it ended (see ending()), frees all its frames, removes it
     //     from the table, and continues with the next process.
-    //   - A blocked process (Process::blocked, a wait with nothing to collect yet)
-    //     is skipped. The end of a child it waits for makes it runnable again.
+    //   - A blocked process (Process::blocked) is skipped: a wait with nothing to
+    //     collect yet, or a disk_read / disk_write whose request hasn't
+    //     completed. The end of a child it waits for, or the disk interrupt for
+    //     its request, makes it runnable again.
+    //   - Disk requests are queued and given to the disk one at a time, first
+    //     come first served (spec B3, disk_read / disk_write).
     //   - System calls act on the process that made them: its memory and its break.
     //   - After StepLimit, calling run_all() again continues where it stopped.
     std::variant<AllDone, StepLimit> run_all(uint64_t max_steps);
@@ -90,6 +100,9 @@ private :
     machine::Machine& machine_;
     std::ostream& out_;
     std::ostream& err_;
+    std::queue<PendingIO> pending_ios_;
+
+    std::variant<Continue, Switch> disk_io(disk::Op op);
     
     std::variant<Exited, Killed, Continue, Switch> handle_trap(const cpu::Trap& trap);
     
@@ -116,7 +129,13 @@ private :
 
     Continue sys_getpid();
 
+    std::variant<Continue, Switch> sys_disk_read();
+
+    std::variant<Continue, Switch> sys_disk_write();
+
     std::variant<Killed, Continue> handle_page_fault(const cpu::Trap& trap);
+
+    Continue handle_disk_interrupt();
 
     Switch sys_yield();
 
@@ -147,6 +166,12 @@ private :
         return process.page_table;
     }
 
+    disk::Disk& disk() {
+        return machine_.disk();
+    }
+
+    void start_next_request();
+
     mmu::PageTable share_table(mmu::PageTable& other);
 
     void copy_frame(uint32_t old_frame, uint32_t new_frame);
@@ -170,7 +195,7 @@ private :
 
     std::optional<uint32_t> try_access(uint32_t addr, mmu::Access access);
 
-    Process& find_next_process(uint32_t last_exec);
+    Process* find_next_process(uint32_t last_exec);
 
     void end_process(Process& process, std::variant<Exited, Killed> status);
 

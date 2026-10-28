@@ -470,8 +470,8 @@ TEST(wait_sleeps_parent_is_blocked_while_child_runs) {
     const kernel::Process* child = s.k.process(2);
     CHECK(parent != nullptr && child != nullptr);
     if (!parent || !child) return;
-    CHECK(parent->blocked);
-    CHECK(!child->blocked);
+    CHECK(parent->blocked == kernel::BlockReason::Wait);
+    CHECK(child->blocked == kernel::BlockReason::None);
 }
 
 TEST(wait_sleeps_blocked_parent_runs_no_instructions) {
@@ -498,7 +498,7 @@ TEST(wait_sleeps_child_exit_makes_parent_runnable) {
     const kernel::Process* parent = s.k.process(1);
     CHECK(parent != nullptr);
     if (!parent) return;
-    CHECK(!parent->blocked);
+    CHECK(parent->blocked == kernel::BlockReason::None);
     const auto ending = s.k.ending(2);
     CHECK(ending.has_value() && ending->collected);
 }
@@ -521,7 +521,7 @@ TEST(wait_sleeps_other_child_does_not_wake) {
     CHECK(s.k.ending(2).has_value());
     const kernel::Process* parent = s.k.process(1);
     CHECK(parent != nullptr);
-    if (parent) CHECK(parent->blocked);
+    if (parent) CHECK(parent->blocked == kernel::BlockReason::Wait);
 }
 
 TEST(wait_sleeps_grandchild_end_does_not_wake) {
@@ -542,7 +542,7 @@ TEST(wait_sleeps_grandchild_end_does_not_wake) {
     CHECK(s.k.ending(3).has_value());
     const kernel::Process* parent = s.k.process(1);
     CHECK(parent != nullptr);
-    if (parent) CHECK(parent->blocked);
+    if (parent) CHECK(parent->blocked == kernel::BlockReason::Wait);
 }
 
 TEST(wait_sleeps_killed_child_wakes_parent) {

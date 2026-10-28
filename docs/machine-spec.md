@@ -271,7 +271,7 @@ The register convention is the same as Linux on RISC-V:
 | `a0`–`a5` (`x10`–`x15`) | Arguments |
 | `a0` | Return value. A negative value is an error code (`-errno`). |
 
-The program executes `ECALL`. The kernel handles the call and resumes the program at `pc + 4` (except a blocked `wait`, see below). The kernel changes no registers other than `a0`.
+The program executes `ECALL`. The kernel handles the call and resumes the program at `pc + 4` (except a blocked `wait`, see below). A call may **block** the caller (`wait`, `disk_read`, `disk_write`): it runs no instructions until the kernel makes it runnable again. The kernel changes no registers other than `a0`.
 
 The call numbers are our own, not Linux's, because we don't aim to run Linux binaries.
 
@@ -285,6 +285,8 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 | 6 | `fork` | — | In the parent: the child's pid. In the child: 0 | 5 |
 | 7 | `exec` | To be defined | | 5 |
 | 8 | `wait` | `a0` = pid to wait for (−1: any child), `a1` = address to store the status (0: don't store) | The pid of the child that ended | 5 |
+| 9 | `disk_read` | `a0` = first sector, `a1` = buffer address, `a2` = sector count | 0 | 6 |
+| 10 | `disk_write` | `a0` = first sector, `a1` = buffer address, `a2` = sector count | 0 | 6 |
 
 For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 
@@ -304,11 +306,20 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 
 **`wait`** lets a parent collect a child that has ended:
 
-- It waits for a child of the caller that has ended: the one with pid `a0`, or any child if `a0` is −1. If such a child has already ended, it returns at once. Otherwise the caller is **blocked**: the scheduler skips it, so it runs no instructions, until a matching child ends (exits or is killed). That makes the caller runnable again. While blocked, its `pc` stays on the `ECALL`, so when it is next scheduled the `wait` runs again and collects the child. A blocked `wait` changed nothing, so running it again is safe. Deadlock is impossible: a blocked process always has a live child, and following children down always reaches one that isn't blocked.
+- It waits for a child of the caller that has ended: the one with pid `a0`, or any child if `a0` is −1. If such a child has already ended, it returns at once. Otherwise the caller is **blocked**: the scheduler skips it, so it runs no instructions, until a matching child ends (exits or is killed). That makes the caller runnable again. While blocked, its `pc` stays on the `ECALL`, so when it is next scheduled the `wait` runs again and collects the child. A blocked `wait` changed nothing, so running it again is safe. Deadlock is impossible: a process blocked in `wait` always has a live child, and following children down always reaches one that isn't blocked in `wait`. That one is either runnable or waiting for the disk, which always finishes.
 - It returns the child's pid. If `a1` isn't 0, it stores the child's status there as a 32-bit word: the exit status if the child called `exit`, or 128 + the trap cause if it was killed. Then the child is forgotten: a second `wait` can't collect it again.
 - If the caller has no child matching `a0` (ended or still running), it returns `-ECHILD` at once.
 - If `a1` isn't 0 and the status can't be stored there (the address isn't 4-byte aligned, like `SW`, or isn't writable by the caller), it returns `-EFAULT` and the child is **not** collected. Like `write`, the kernel maps an untouched heap or stack page first.
 - A child whose parent has ended has no parent; nobody can wait for it.
+
+**`disk_read` and `disk_write`** give a program raw access to the disk (A6), like reading `/dev/sda` on Linux. There is no file system yet; these are the first users of the kernel's disk driver, which swap and the file system will reuse later.
+
+- They move `a2` whole sectors, starting at sector `a0`, between the disk and the buffer at `a1`: `disk_read` copies disk → buffer, `disk_write` copies buffer → disk.
+- **Arguments** are checked first, and the call returns `-EINVAL` at once, without blocking, if: the count is 0; the sectors run past the end of the disk; or the buffer (`a2 × 512` bytes from `a1`) does not lie within **one page**. The disk copies to one contiguous range of physical RAM (DMA, A6), and only a single page is guaranteed to be contiguous.
+- **The buffer page** is then checked like any pointer (Rules, below): `disk_read` needs it writable, `disk_write` needs it readable. An untouched heap or stack page is mapped first, and `disk_read` breaks copy-on-write first, so the disk writes into a frame only this process uses. Otherwise: `-EFAULT` at once.
+- **The caller blocks** while its request waits and runs. The kernel keeps a **queue** of requests from all processes and gives them to the disk one at a time, in **arrival order** (first come, first served) for now. A request is submitted to the disk, with the clock at that moment, when the disk becomes idle and the request is at the head of the queue.
+- **Completion.** When the disk interrupt for the request comes, the kernel acknowledges it, stores 0 in the caller's saved `a0`, makes the caller runnable, and submits the next queued request. The caller resumes at `pc + 4`. Unlike a blocked `wait`, the `ECALL` is **not** run again: the transfer has already happened.
+- **Idle.** If every process is blocked, the kernel waits for the next interrupt (A4): the clock jumps ahead without running instructions. A disk request is always in flight then, so the wait ends. Idle time is clock time: it counts towards the step limit of `run_all`.
 
 **Error codes** use Linux's values so they are familiar:
 
@@ -324,7 +335,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 **Rules:**
 
 - An unknown system call number returns `-ENOSYS`. The process is not killed.
-- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. If no frame is free for it, the call returns `-EFAULT`. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed call is a blocked `wait`, which had none.
+- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. If no frame is free for it, the call returns `-EFAULT`. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed call is a blocked `wait`, which had none; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
 
 ---
 
