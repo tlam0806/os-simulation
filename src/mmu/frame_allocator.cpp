@@ -27,7 +27,7 @@ void FrameAllocator::free(uint32_t frame) {
 
 uint32_t FrameAllocator::free_count() const { 
     uint32_t count = 0;
-    for (int i = 0; i < kNumFrames; ++i) {
+    for (uint32_t i = 0; i < kNumFrames; ++i) {
         count += (reading_count[i] == 0);
     }
     return count;

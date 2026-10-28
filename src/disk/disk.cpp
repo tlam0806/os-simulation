@@ -34,14 +34,17 @@ bool Disk::host_write(uint32_t sector, std::span<const uint8_t> bytes) {
     return true;
 }
 
-std::optional<std::vector<uint8_t>> Disk::host_read(uint32_t sector, uint32_t num_sectors) const { 
-    uint64_t last_sector = (uint64_t) sector + (uint64_t) num_sectors - 1;
+std::optional<std::vector<uint8_t>> Disk::host_read(uint32_t sector, uint32_t count) const { 
+    uint64_t last_sector = (uint64_t) sector + (uint64_t) count - 1;
+    if (count == 0) {
+        return std::nullopt;
+    }
     if (last_sector >= static_cast<uint64_t>(kNumSectors)) {
         return std::nullopt;
     }
     std::vector<uint8_t> returned;
-    returned.reserve(num_sectors * kSectorSize);
-    for (uint32_t s = sector; s < sector + num_sectors; ++s) {
+    returned.reserve(count * kSectorSize);
+    for (uint32_t s = sector; s < sector + count; ++s) {
         auto it = sectors_.find(s);
         if (it == sectors_.end()) {
             returned.insert(returned.end(), kSectorSize, 0);

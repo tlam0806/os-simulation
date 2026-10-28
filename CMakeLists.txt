@@ -73,6 +73,7 @@ add_executable(ossim_tests
   tests/kernel_fork_test.cpp
   tests/kernel_wait_test.cpp
   tests/disk_test.cpp
+  tests/machine_disk_test.cpp
 )
 target_link_libraries(ossim_tests PRIVATE ossim_core)
 add_test(NAME ossim_tests COMMAND ossim_tests)

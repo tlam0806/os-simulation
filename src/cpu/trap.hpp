@@ -18,6 +18,7 @@ enum class Cause : uint32_t {
     store_page_fault               = 15,
 
     timer_interrupt                = 0x80000005,
+    disk_interrupt                 = 0x80000009,
 };
 
 struct Trap {
