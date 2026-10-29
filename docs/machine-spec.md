@@ -6,6 +6,7 @@ This document defines the simulated machine: the "hardware" that user programs r
 
 - **Part A** describes the hardware: CPU, memory, traps, timer, disk.
 - **Part B** describes the conventions between user programs and the kernel: address space layout, program loading, system calls.
+- **Part C** describes the file system: how files are laid out on the disk, and how the kernel reads them.
 
 Instruction behavior follows the [RISC-V Unprivileged ISA Specification](https://github.com/riscv/riscv-isa-manual/releases). This document only records the choices RISC-V leaves open and the places where we simplify.
 
@@ -335,7 +336,94 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 **Rules:**
 
 - An unknown system call number returns `-ENOSYS`. The process is not killed.
-- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. If no frame is free for it, the call returns `-EFAULT`. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed call is a blocked `wait`, which had none; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
+- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. If no frame is free for it, the call returns `-EFAULT`. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed calls are a blocked `wait` and a file-system call blocked on a missing block (C2), which had none; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
+
+---
+
+# Part C — File system
+
+One file system covers the whole disk: there is no partition table. Its design is the inode scheme from the lectures (indexed allocation, a free-block bitmap, directories as files), close to a much simplified ext2.
+
+## C1. On-disk layout
+
+All numbers on the disk are **little-endian**, like RAM.
+
+**Blocks.** The file system works in **blocks of 4096 bytes**: one page, 8 sectors. Block `b` is sectors `8b` to `8b + 7`. The disk has 131072 / 8 = **16384 blocks**. One block always fits in one page, so reading or writing it is a single disk request.
+
+| Block | Contents |
+|---|---|
+| 0 | Superblock |
+| 1 | Block bitmap |
+| 2–17 | Inode table (16 blocks) |
+| 18–16383 | Data blocks |
+
+**Superblock** (block 0). Seven 32-bit words at the start of the block; the rest of the block is 0.
+
+| Offset | Field | Value |
+|---|---|---|
+| 0 | `magic` | `0x5346534F` (the bytes `"OSFS"`) |
+| 4 | `block_count` | 16384 |
+| 8 | `inode_count` | 1024 |
+| 12 | `bitmap_start` | 1 |
+| 16 | `inode_start` | 2 |
+| 20 | `inode_blocks` | 16 |
+| 24 | `data_start` | 18 |
+
+A disk whose block 0 doesn't start with this magic is **not formatted**: the kernel finds no file system on it.
+
+**Block bitmap** (block 1). One bit per block, 1 = in use. Block `b` is bit `b % 8` (least significant first) of byte `b / 8`. Blocks 0–17 are always marked in use. 16384 bits use the first 2048 bytes; the rest of the block is 0.
+
+**Inode table** (blocks 2–17). 1024 inodes of **64 bytes**, 64 per block: inode `i` is at offset `(i % 64) × 64` in block `2 + i / 64`.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 2 | `type`: 0 = free, 1 = regular file, 2 = directory |
+| 2 | 2 | `links`: how many directory entries name this inode |
+| 4 | 4 | `size` in bytes |
+| 8 | 48 | `direct[12]`: block numbers of the file's blocks 0–11 |
+| 56 | 4 | `indirect`: block number of the indirect block, or 0 |
+| 60 | 4 | Unused, 0 |
+
+- **Inode 0 is never used**: inode number 0 means "no inode". **Inode 1 is the root directory** `/`.
+- A free inode (type 0) is all zeros. There is no inode bitmap: finding a free inode means scanning for type 0.
+- **No holes.** A file of `size` bytes owns exactly `ceil(size / 4096)` blocks, its file blocks 0, 1, 2, …, and every one of them is allocated. Block number 0 (the superblock) never appears as a data block, so 0 in `direct` or `indirect` means "none". Bytes of the last block past `size` are 0.
+- **Indirect block.** File blocks 12 and up are listed in the indirect block: 1024 block numbers, for file blocks 12 to 1035. The largest file is 1036 blocks = **4 243 456 bytes**.
+
+**Directories.** A directory is an inode of type 2 whose contents are **32-byte entries**:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | Inode number (0: empty entry) |
+| 4 | 28 | Name, padded with zero bytes |
+
+- A name is 1–27 bytes, with no `/` and no zero byte (so it always ends with at least one zero byte). Names are compared byte for byte: case matters.
+- A directory's `size` is a multiple of 32. Empty entries may appear anywhere; a lookup skips them.
+- Names in one directory are unique. There are no `.` and `..` entries for now.
+- The root directory always exists. On a freshly formatted disk it is empty (`size` 0, no blocks), with `links` = 1.
+
+## C2. How the kernel reads the file system
+
+The kernel reads file-system blocks through a **block cache**, and a system call that needs a block that isn't cached yet **blocks and is re-run** once the block arrives.
+
+**The block cache** holds copies of disk blocks in RAM.
+
+- Each cached block uses one RAM **frame**, taken from the frame allocator like any other frame (a block is exactly one page). The disk reads it into that frame by DMA, like `disk_read`.
+- The cache holds at most **16 blocks**. To read a block into a full cache, the kernel first evicts the **least recently used** block that isn't pinned (below) and frees its frame. If every block is pinned, or no frame is free, the system call returns `-ENOMEM`.
+- For now the cache is read-only: no system call changes a cached block.
+- A `disk_write` that covers part of a cached block removes that block from the cache when it completes, so the cache never holds stale data.
+
+**Missing blocks: block and re-run.** A file-system system call works in two phases:
+
+1. **Look.** It reads every block it needs, through the cache, and checks every argument. It changes nothing yet.
+2. **Act.** Only when it has everything does it make changes and return.
+
+If the look phase needs a block that isn't cached, the call stops there:
+
+- The kernel queues a read of that block into a fresh cache frame, in the same first-come, first-served disk queue as `disk_read` and `disk_write`. If a read of that block is already queued or in flight (for another process), it doesn't queue a second one.
+- The caller **blocks**, with its `pc` left on the `ECALL`, exactly like a blocked `wait`.
+- When the read completes, the block is in the cache, and **every** process waiting for that block becomes runnable. When one of them is next scheduled, its `ECALL` runs again **from the start**. This time the block is a cache hit, so it gets further, and may block again on the next block it needs.
+
+Running the call again is safe because the look phase changed nothing. The call always makes progress: a block read for a process is **pinned**, so it can't be evicted, until that process's `ECALL` has run again. Each run then finds at least one more of its blocks in the cache.
 
 ---
 
