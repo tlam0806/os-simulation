@@ -38,9 +38,11 @@ struct Place {
 Place place_of(uint32_t s);
 
 enum class Op { read, write };
+// read :  read from the disk into Ram
+// write : write from Ram to the disk
 
 struct Request {
-    Op op = Op::read;
+    Op op = Op::read; 
     uint32_t first_sector = 0;
     uint32_t count = 0;       // sectors, >= 1
     uint32_t ram_addr = 0;    // physical RAM address of count * kSectorSize bytes

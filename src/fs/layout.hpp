@@ -98,6 +98,17 @@ std::array<uint8_t, kDirEntrySize> encode_dir_entry(const DirEntry& entry);
 // The name is the bytes before the first zero byte.
 DirEntry decode_dir_entry(std::span<const uint8_t, kDirEntrySize> bytes);
 
+// Where inode i lives: its inode-table block, and its byte offset in that block.
+struct InodeLocation {
+    uint32_t block;
+    uint32_t offset;
+};
+InodeLocation inode_location(uint32_t i);
+
+// Looks for name among the first used_bytes bytes of a directory block (the rest
+// is past the directory's end). The inode number, or nullopt. Empty entries never match.
+std::optional<uint32_t> find_in_dir_block(const Block& block, uint32_t used_bytes, std::string_view name);
+
 // ---- host access to a disk image (untimed) ----
 
 // Block b, or nullopt if b >= kNumBlocks.

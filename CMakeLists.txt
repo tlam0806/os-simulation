@@ -34,10 +34,14 @@ add_library(ossim_core
   src/machine/machine.cpp
   src/kernel/kernel.cpp
   src/kernel/syscalls.cpp
+  src/kernel/memory.cpp
+  src/kernel/disk_driver.cpp
+  src/kernel/file_system.cpp
   src/mmu/page_table.cpp
   src/mmu/frame_allocator.cpp
   src/disk/disk.cpp
   src/fs/layout.cpp
+  src/fs/ops.cpp
 )
 target_include_directories(ossim_core PUBLIC src)
 target_link_libraries(ossim_core PUBLIC ossim_options)
@@ -77,6 +81,12 @@ add_executable(ossim_tests
   tests/machine_disk_test.cpp
   tests/kernel_disk_test.cpp
   tests/fs_layout_test.cpp
+  tests/fs_ops_test.cpp
+  tests/kernel_open_test.cpp
+  tests/kernel_close_test.cpp
+  tests/kernel_lseek_test.cpp
+  tests/kernel_read_test.cpp
+  tests/kernel_fork_files_test.cpp
 )
 target_link_libraries(ossim_tests PRIVATE ossim_core)
 add_test(NAME ossim_tests COMMAND ossim_tests)

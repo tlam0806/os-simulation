@@ -17,14 +17,23 @@ inline constexpr uint32_t kSysExec = 7;   // not defined yet
 inline constexpr uint32_t kSysWait = 8;
 inline constexpr uint32_t kSysDiskRead = 9;
 inline constexpr uint32_t kSysDiskWrite = 10;
+inline constexpr uint32_t kSysOpen = 11;
+inline constexpr uint32_t kSysClose = 12;
+inline constexpr uint32_t kSysRead = 13;
+inline constexpr uint32_t kSysLseek = 14;
 
 // Error codes, using Linux's values. A failed call returns -code in a0.
 // (Not EBADF etc.: those names are macros in <errno.h>.)
+inline constexpr int32_t kEnoent = 2;   // no such file or directory
 inline constexpr int32_t kEbadf = 9;    // bad file descriptor
 inline constexpr int32_t kEchild = 10;  // no child to wait for
 inline constexpr int32_t kEnomem = 12;  // out of memory
 inline constexpr int32_t kEfault = 14;  // bad pointer passed to the kernel
+inline constexpr int32_t kEnotdir = 20; // not a directory
 inline constexpr int32_t kEinval = 22;  // invalid argument
+inline constexpr int32_t kEnfile = 23;  // the open-file table is full
+inline constexpr int32_t kEmfile = 24;  // the process's fd table is full
+inline constexpr int32_t kEnametoolong = 36;  // path too long
 inline constexpr int32_t kEnosys = 38;  // unknown system call number
 
 }  // namespace kernel::abi

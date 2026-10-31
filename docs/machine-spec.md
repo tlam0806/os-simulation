@@ -288,8 +288,12 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 | 8 | `wait` | `a0` = pid to wait for (−1: any child), `a1` = address to store the status (0: don't store) | The pid of the child that ended | 5 |
 | 9 | `disk_read` | `a0` = first sector, `a1` = buffer address, `a2` = sector count | 0 | 6 |
 | 10 | `disk_write` | `a0` = first sector, `a1` = buffer address, `a2` = sector count | 0 | 6 |
+| 11 | `open` | `a0` = path address | A file descriptor | 7 |
+| 12 | `close` | `a0` = fd | 0 | 7 |
+| 13 | `read` | `a0` = fd, `a1` = buffer address, `a2` = byte count | Bytes read | 7 |
+| 14 | `lseek` | `a0` = fd, `a1` = offset, `a2` = whence | The new offset | 7 |
 
-For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
+For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (11–14) are described in C3.
 
 `sbrk` returns `-EINVAL` if the new break would be below the initial break, and `-ENOMEM` if it would be above `0x7FF00000`. Otherwise it always succeeds: it maps nothing (see B1). Shrinking unmaps the heap pages the heap no longer covers; each of their frames is freed once no other mapping uses it (see `fork`).
 
@@ -326,11 +330,16 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr).
 
 | Name | Value | Meaning |
 |---|---|---|
+| `ENOENT` | 2 | No such file or directory |
 | `EBADF` | 9 | Bad file descriptor |
 | `ECHILD` | 10 | No child to wait for |
 | `ENOMEM` | 12 | Out of memory |
 | `EFAULT` | 14 | Bad pointer passed to the kernel |
+| `ENOTDIR` | 20 | Not a directory |
 | `EINVAL` | 22 | Invalid argument |
+| `ENFILE` | 23 | The open-file table is full |
+| `EMFILE` | 24 | The process's fd table is full |
+| `ENAMETOOLONG` | 36 | Path too long |
 | `ENOSYS` | 38 | Unknown system call number |
 
 **Rules:**
@@ -405,12 +414,11 @@ A disk whose block 0 doesn't start with this magic is **not formatted**: the ker
 
 The kernel reads file-system blocks through a **block cache**, and a system call that needs a block that isn't cached yet **blocks and is re-run** once the block arrives.
 
-**The block cache** holds copies of disk blocks in RAM.
+**The block cache** holds copies of disk blocks in RAM (L11, "buffers for disk blocks").
 
 - Each cached block uses one RAM **frame**, taken from the frame allocator like any other frame (a block is exactly one page). The disk reads it into that frame by DMA, like `disk_read`.
-- The cache holds at most **16 blocks**. To read a block into a full cache, the kernel first evicts the **least recently used** block that isn't pinned (below) and frees its frame. If every block is pinned, or no frame is free, the system call returns `-ENOMEM`.
-- For now the cache is read-only: no system call changes a cached block.
-- A `disk_write` that covers part of a cached block removes that block from the cache when it completes, so the cache never holds stale data.
+- For simplicity the cache **keeps every block it reads** and never evicts one. Programs read few blocks, so RAM doesn't run out. If no frame is free for a block, the system call returns `-ENOMEM`.
+- The cache is read-only: no system call changes a cached block. Raw `disk_write`s to file-system blocks are not kept consistent with the cache; don't mix them.
 
 **Missing blocks: block and re-run.** A file-system system call works in two phases:
 
@@ -423,7 +431,32 @@ If the look phase needs a block that isn't cached, the call stops there:
 - The caller **blocks**, with its `pc` left on the `ECALL`, exactly like a blocked `wait`.
 - When the read completes, the block is in the cache, and **every** process waiting for that block becomes runnable. When one of them is next scheduled, its `ECALL` runs again **from the start**. This time the block is a cache hit, so it gets further, and may block again on the next block it needs.
 
-Running the call again is safe because the look phase changed nothing. The call always makes progress: a block read for a process is **pinned**, so it can't be evicted, until that process's `ECALL` has run again. Each run then finds at least one more of its blocks in the cache.
+Running the call again is safe because the look phase changed nothing. The call always makes progress: blocks are never evicted, so each run finds at least one more of its blocks in the cache.
+
+**Details:**
+
+- A block's frame is taken when its read is **queued**. It becomes a cache hit only when the read completes.
+- The kernel never needs the superblock or the bitmap to read files: the layout is fixed (C1), so it goes straight to inode and data blocks.
+- The disk interrupt for a cache read stores nothing in any register: the woken processes re-run their `ECALL`.
+
+## C3. File system calls
+
+`open`, `read`, `close` and `lseek` (B3) give programs read-only access to files. They follow C2: each is a look phase that may block and re-run, then an act phase that can't fail.
+
+**Open files: two tables** (L11, "File System in Action"):
+
+- The **open-file table** is system-wide: one entry per `open` call, holding the file's inode number and the **offset** (where the next `read` starts, initially 0). At most **64** entries.
+- Each process has an **fd table** of **16** slots, fds 0–15. A slot is empty or points to an open-file entry. Fds 0, 1 and 2 are stdin, stdout and stderr: they never point to an open-file entry, and `read`, `close` and `lseek` on them return `-EBADF`. (`write` keeps working on 1 and 2 as before; `write` on a file returns `-EBADF`.)
+- `fork` copies the parent's fd table: each copied slot points to the **same** open-file entry, so parent and child share its offset (as in Unix). An entry is freed when no fd points to it any more: after `close`, or when a process ends (an ending process closes all its fds).
+
+**Paths.** `open` takes a path as a zero-terminated string in user memory, at most **256** bytes including the zero. It is read byte by byte like any user pointer (B3, Rules): an untouched heap or stack page is mapped, an inaccessible byte gives `-EFAULT`. No zero byte in the first 256 gives `-ENAMETOOLONG`. The path is then followed like `fs::resolve`: absolute, with empty names between slashes skipped, through the cache.
+
+**Calls:**
+
+- **`open(path)`** returns the lowest empty fd ≥ 3. A directory can be opened too: reading it returns its raw 32-byte entries (C1). Errors: first `-EFAULT` / `-ENAMETOOLONG` (reading the path), then `-EINVAL` if the path is empty or doesn't start with `/`. Then the walk checks each name when it reaches it, in order: `-EINVAL` if the name isn't valid, `-ENOTDIR` if the directory it should be in is a regular file, `-ENOENT` if it isn't in its directory. So `/nope/<bad name>` is `-ENOENT`: the walk stops at `nope`. Last, `-EMFILE` if the fd table is full, `-ENFILE` if the open-file table is full. The fd and the entry are taken only in the act phase.
+- **`read(fd, buffer, count)`** copies bytes from the file, starting at the entry's offset, to the buffer, and moves the offset forward by as many. It returns how many it copied: `min(count, size − offset)`, but **never past the end of the block the offset is in**, so one call needs at most one data block. A shorter count than asked for is not an error (as in Unix); 0 means the offset is at the end of the file. Errors: `-EBADF` if fd isn't an open file; `-EFAULT` if the bytes to be copied don't fit in writable user memory (checked like `write`'s buffer, before anything is copied, so the offset doesn't move).
+- **`close(fd)`** empties the fd slot and returns 0; the open-file entry is freed if nothing else points to it. `-EBADF` if fd isn't an open file. It never blocks.
+- **`lseek(fd, offset, whence)`** sets the entry's offset to `offset` (`whence` 0), the current offset + `offset` (1), or the file's size + `offset` (2), with `offset` a signed 32-bit number, and returns the new offset. `-EBADF` if fd isn't an open file, `-EINVAL` if `whence` is something else or the result would be negative or above `0x7FFFFFFF`. The offset may go past the end: `read` then returns 0. `whence` 2 needs the inode, so it may block.
 
 ---
 

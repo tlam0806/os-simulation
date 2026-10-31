@@ -2,28 +2,16 @@
 // TODO: every function below is a stub so the project builds. Replace them.
 #include "fs/layout.hpp"
 
+#include <algorithm>
+
+#include "util/bytes.hpp"
+
 namespace fs {
 
-namespace {
-    uint16_t get16(std::span<const uint8_t> f, size_t at) {
-    return static_cast<uint16_t>(f[at] | f[at + 1] << 8);
-    }
-
-    uint32_t get32(std::span<const uint8_t> f, size_t at) {
-        return uint32_t{f[at]} | uint32_t{f[at + 1]} << 8 | uint32_t{f[at + 2]} << 16 |
-            uint32_t{f[at + 3]} << 24;
-    }
-    void put16(std::span<uint8_t> f, size_t at, uint16_t value) {
-        f[at] = static_cast<uint8_t>(value);
-        f[at + 1] = static_cast<uint8_t>(value >> 8);
-    }
-    void put32(std::span<uint8_t> f, size_t at, uint32_t value) {
-        f[at] = static_cast<uint8_t>(value);
-        f[at + 1] = static_cast<uint8_t>(value >> 8);
-        f[at + 2] = static_cast<uint8_t>(value >> 16);
-        f[at + 3] = static_cast<uint8_t>(value >> 24);
-    }
-}
+using util::get16;
+using util::get32;
+using util::put16;
+using util::put32;
 
 Block encode_superblock(const Superblock& sp) { 
     Block block{};
@@ -119,6 +107,18 @@ DirEntry decode_dir_entry(std::span<const uint8_t, kDirEntrySize> bytes) {
     return entry;
 }
 
+InodeLocation inode_location(uint32_t i) {
+    return {kInodeStart + i / kInodesPerBlock, (i % kInodesPerBlock) * kInodeSize};
+}
+
+std::optional<uint32_t> find_in_dir_block(const Block& block, uint32_t used_bytes, std::string_view name) {
+    for (uint32_t off = 0; off + kDirEntrySize <= std::min(used_bytes, kBlockSize); off += kDirEntrySize) {
+        const DirEntry entry = decode_dir_entry(std::span<const uint8_t, kDirEntrySize>(block.data() + off, kDirEntrySize));
+        if (entry.inode != 0 && entry.name == name) return entry.inode;
+    }
+    return std::nullopt;
+}
+
 std::optional<Block> read_block(const disk::Disk& disk, uint32_t block_num) { 
     if (block_num >= kNumBlocks) {
         return std::nullopt;
@@ -147,9 +147,7 @@ std::optional<Inode> read_inode(const disk::Disk& disk, uint32_t inode_num) {
     if (inode_num >= kNumInodes) {
         return std::nullopt;
     }
-    uint32_t inodes_per_block = kBlockSize / kInodeSize;
-    uint32_t block_num = inode_num / inodes_per_block + kInodeStart;
-    uint32_t offset = (inode_num % inodes_per_block) * kInodeSize;
+    const auto [block_num, offset] = inode_location(inode_num);
     std::optional<Block> block = read_block(disk, block_num);
     if (!block) {
         return std::nullopt;
@@ -163,9 +161,7 @@ bool write_inode(disk::Disk& disk, uint32_t inode_num, const Inode& inode) {
     if (inode_num >= kNumInodes) {
         return false;
     }
-    uint32_t inodes_per_block = kBlockSize / kInodeSize;
-    uint32_t block_num = inode_num / inodes_per_block + kInodeStart; 
-    uint32_t offset = (inode_num % inodes_per_block) * kInodeSize;
+    const auto [block_num, offset] = inode_location(inode_num);
     std::optional<Block> block = read_block(disk, block_num);
     if (!block) {
         return false;

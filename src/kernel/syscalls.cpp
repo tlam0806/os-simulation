@@ -30,18 +30,20 @@ std::variant<Exited, Continue, Switch> Kernel::handle_syscall() {
             return util::convert_variant<Exited, Continue, Switch>(sys_disk_read());
         case abi::kSysDiskWrite :
             return util::convert_variant<Exited, Continue, Switch>(sys_disk_write());
+        case abi::kSysOpen : 
+            return util::convert_variant<Exited, Continue, Switch>(sys_open());
+        case abi::kSysClose :
+            return sys_close();
+        case abi::kSysLseek :
+            return util::convert_variant<Exited, Continue, Switch>(sys_lseek());
+        case abi::kSysRead : 
+            return util::convert_variant<Exited, Continue, Switch>(sys_read());
         default :
             return sys_other();
     }
 }
 
-std::variant<Continue, Switch> Kernel::sys_disk_read() {
-    return disk_io(disk::Op::read);
-}
 
-std::variant<Continue, Switch> Kernel::sys_disk_write() {
-    return disk_io(disk::Op::write);
-}
 
 Exited Kernel::sys_exit() {
     int32_t a0_value = static_cast<int32_t>(cpu().reg(isa::reg::a0));
@@ -113,6 +115,9 @@ Continue Kernel::sys_fork() {
     copied.context.regs[isa::reg::a0] = 0; 
     mmu::PageTable shared = share_table(page_table());
     copied.page_table = shared;
+    for (auto& fd : copied.fd_table) {
+        if (fd) share_open_file(*fd);
+    }
     uint32_t child_pid = create_process(std::move(copied));
     cpu().set_reg(isa::reg::a0, child_pid);
     return Continue{};
@@ -166,176 +171,6 @@ Continue Kernel::sys_exec() {
 Continue Kernel::sys_other() {
     cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnosys));
     return Continue{};
-}
-
-// ---- memory helpers ----
-
-void Kernel::start_next_request() {
-    assert(!disk().busy());
-    const PendingIO& next = pending_ios_.front();
-    bool submitted = disk().submit(next.request, machine_.steps());
-    assert(submitted);
-}
-
-std::variant<Continue, Switch> Kernel::disk_io(disk::Op op) {
-    uint32_t sector = cpu().reg(isa::reg::a0);
-    uint32_t buffer_addr = cpu().reg(isa::reg::a1);
-    uint32_t count = cpu().reg(isa::reg::a2);
-    if (count == 0) {
-        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
-        return Continue{};
-    }
-    if (static_cast<uint64_t>(sector) + static_cast<uint64_t>(count) > static_cast<uint64_t>(disk::kNumSectors)) {
-        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
-        return Continue{};
-    }
-    uint64_t last = static_cast<uint64_t>(buffer_addr) + static_cast<uint64_t>(count) * disk::kSectorSize - 1;
-    if (last > UINT32_MAX) {
-        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
-        return Continue{};
-    }
-    if (mmu::get_vpn(buffer_addr) != mmu::get_vpn(static_cast<uint32_t>(last))) {
-        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
-        return Continue{};
-    }
-    mmu::Access access = (op == disk::Op::read ? mmu::Access::store : mmu::Access::load);
-    auto physical_addr = try_access(buffer_addr, access);
-    if (!physical_addr) {
-        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
-        return Continue{};
-    }
-    cpu().set_reg(isa::reg::a0, 0);
-    pending_ios_.push(PendingIO{executing_pid, disk::Request{op, sector, count, *physical_addr}});
-    process().blocked = kernel::BlockReason::IO;
-    if (!disk().busy()) {
-        start_next_request();
-    }
-    return Switch{};
-}
-
-std::optional<mmu::Pte> Kernel::handle_cow(mmu::Pte pte) {
-    assert(pte.cow == true);
-    assert(pte.write == false);
-    if (frame_allocator().ref_count(pte.frame) > 1) {
-        std::optional<uint32_t> new_frame = frame_allocator().allocate();
-        if (!new_frame) {
-            return std::nullopt;
-        }
-        copy_frame(pte.frame, *new_frame);
-        frame_allocator().free(pte.frame);
-        pte.frame = *new_frame;
-    }   
-    pte.cow = false;
-    pte.write = true;
-    return pte;
-}
-
-std::optional<uint32_t> Kernel::try_access(uint32_t addr, mmu::Access access) {
-    std::optional<uint32_t> physical_addr = mmu::translate(page_table(), addr, access);
-    if (physical_addr) {
-        return *physical_addr;
-    }
-    if (!in_region(addr)) {
-        return std::nullopt;
-    }
-    uint32_t vpn = mmu::get_vpn(addr);
-    std::optional<mmu::Pte> found = page_table().lookup(vpn);
-    if (found && found->cow && access == mmu::Access::store) { // copy-on-write
-        auto new_pte = handle_cow(*found);
-        if (!new_pte) {
-            return std::nullopt;
-        }
-        page_table().map(vpn, *new_pte);
-        physical_addr = mmu::translate(page_table(), addr, access);
-        assert(physical_addr);
-        return *physical_addr;
-    }
-    bool created = map_page(vpn);
-    if (!created) {
-        return std::nullopt;
-    }
-    physical_addr = mmu::translate(page_table(), addr, access);
-    assert(physical_addr);
-    return *physical_addr;
-}
-
-void Kernel::copy_frame(uint32_t from_frame, uint32_t to_frame) {
-    bool copied = ram().copy(from_frame * mmu::kPageSize, to_frame * mmu::kPageSize, mmu::kPageSize);
-    assert(copied);
-}
-
-bool Kernel::in_region(uint64_t large_addr) {
-    if (large_addr > UINT32_MAX) {
-        return false;
-    }
-    uint32_t addr = static_cast<uint32_t>(large_addr);
-    if (loader::kStackRegion <= addr && addr < loader::kStackTop) {
-        return true;
-    }
-    uint32_t vpn = mmu::get_vpn(addr);
-    uint32_t first_vpn = mmu::get_vpn(initial_break());
-    uint32_t last_vpn = mmu::get_vpn(current_break() - 1);
-    if (first_vpn <= vpn && vpn <= last_vpn) {
-        return true;
-    }
-    return false;
-}
-
-void Kernel::zero_frame(uint32_t frame) {
-    for (uint32_t addr = frame * mmu::kPageSize; addr < frame * mmu::kPageSize + mmu::kPageSize; addr += 4) {
-        bool writable = ram().write(addr, 4, 0);
-        assert(writable);
-    }
-}
-
-bool Kernel::write_memory_on_ram(uint32_t addr, std::span<uint8_t> buffer) {
-    for (auto byte : buffer) {
-        std::optional<uint32_t> physical_addr = try_access(addr, mmu::Access::store);
-        if (!physical_addr) {
-            return false;
-        }
-        bool wrote = ram().write(*physical_addr, 1, byte);
-        assert(wrote);
-        ++addr;
-    }
-    return true;
-}
-
-std::optional<std::vector<uint8_t>> Kernel::read_memory_on_ram(uint32_t addr, uint32_t bytes_count) {
-    std::vector<uint8_t> returned;
-    while (bytes_count > 0) {
-        std::optional<uint32_t> physical_addr = try_access(addr, mmu::Access::load);
-        if (!physical_addr) {
-            return std::nullopt;
-        }
-        std::optional<uint32_t> readed = ram().read(*physical_addr, 1);
-        if (!readed) {
-            return std::nullopt;
-        }
-        returned.push_back(static_cast<uint8_t>(*readed));
-        ++addr;
-        --bytes_count;
-    }
-    return returned;
-}
-
-bool Kernel::map_page(uint32_t vpn) {
-    std::optional<uint32_t> physical_frame = frame_allocator().allocate();
-    if (!physical_frame) return false;
-    mmu::Pte pte{*physical_frame, true, true, false};
-    zero_frame(*physical_frame);
-    page_table().map(vpn, pte);
-    return true;
-}
-
-bool Kernel::unmap_page(uint32_t vpn) {
-    auto pte = page_table().lookup(vpn);
-    if (!pte) {
-        return false;
-    }
-    frame_allocator().free(pte->frame);
-    page_table().unmap(vpn);
-    return true;
 }
 
 }  // namespace kernel

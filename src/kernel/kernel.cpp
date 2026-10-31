@@ -16,54 +16,6 @@ uint32_t Kernel::create_process(Process&& process) {
     return pid;
 }
 
-std::variant<Killed, Continue> Kernel::handle_page_fault(const cpu::Trap& trap) {
-    uint32_t addr = trap.tval;
-    if (!in_region(addr)) {
-        return Killed{trap};
-    }
-    // the address is valid, inside the region
-    uint32_t vpn = mmu::get_vpn(addr);
-    std::optional<mmu::Pte> found = page_table().lookup(vpn);
-
-    if (!found) {
-        // not mapped yet, should create a new one
-        if (!map_page(vpn)) {
-            return Killed{trap};
-        } else {
-            return Continue{};
-        }
-    }
-    assert(found);
-    if (trap.cause == cpu::Cause::store_page_fault && found->cow) { // copy-on-write
-        auto new_pte = handle_cow(*found);
-        if (!new_pte) {
-            return Killed{trap};
-        }
-        page_table().map(vpn, *new_pte);
-        return Continue{};
-    }
-    return Killed{trap};
-}
-
-Continue Kernel::handle_disk_interrupt() {
-    assert(pending_ios_.size());
-    if (pending_ios_.empty()) {
-        return Continue{};
-    }
-    const PendingIO& next = pending_ios_.front();
-    machine_.acknowledge_disk_interrupt();
-    kernel::Process& process = process_table_.find(next.pid)->second;
-    assert(process.blocked == kernel::BlockReason::IO);
-    process.blocked = kernel::BlockReason::None;
-    process.context.regs[isa::reg::a0] = 0; // return value for disk_read/disk_write
-    assert(disk().busy() == false);
-    pending_ios_.pop();
-    if (pending_ios_.size()) {
-        start_next_request();
-    }
-    return Continue{};
-}
-
 std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Trap& trap) {
     switch (trap.cause) {
         case cpu::Cause::ecall :
@@ -81,24 +33,6 @@ std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Tr
 }
 
 // ---- processes ----
-
-mmu::PageTable Kernel::share_table(mmu::PageTable& other) {
-    mmu::PageTable shared;
-    std::vector<uint32_t> pages = other.mapped_pages();
-    for (uint32_t vpn : pages) {
-        std::optional<mmu::Pte> pte = other.lookup(vpn);
-        assert(pte); // should be in the old page table
-        uint32_t frame = pte->frame;
-        frame_allocator().share(frame);
-        if (pte->write) {
-            pte->write = false;
-            pte->cow = true;
-            other.map(vpn, *pte);
-        } 
-        shared.map(vpn, *pte);
-    }
-    return shared;
-}
 
 std::vector<uint32_t> Kernel::get_running_children_process(uint32_t parent_pid, uint32_t required_pid) {
     const uint32_t any = static_cast<uint32_t>(-1);
@@ -182,6 +116,12 @@ void Kernel::end_process(Process& process, std::variant<Exited, Killed> status) 
     for (uint32_t vpn : process.page_table.mapped_pages()) {
         uint32_t frame = process.page_table.lookup(vpn)->frame;
         frame_allocator().free(frame);
+    }
+    for (auto& fd : process.fd_table) {
+        if (fd) {
+            release_open_file(*fd);
+            fd.reset();
+        }
     }
     // the parent is no longer blocked
     auto parent_it = process_table_.find(process.parent_pid);

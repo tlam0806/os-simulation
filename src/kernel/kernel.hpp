@@ -1,12 +1,15 @@
 #pragma once
+#include <array>
 #include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <map>
 #include <optional>
 #include <queue>
 #include "kernel/process.hpp"
 #include "machine/machine.hpp"
+#include "fs/layout.hpp"
 namespace kernel {
 
 struct Exited {
@@ -37,14 +40,40 @@ struct Ending {
 struct AllDone {
 };
 
+struct CachedBlock {
+    uint32_t frame;
+    bool ready;
+};
+
 // Instructions a process may run before the timer switches to the next one (spec A4).
 inline constexpr uint64_t kQuantum = 1000;
+inline constexpr uint32_t kMaxOpenFiles = 64;
+inline constexpr uint32_t kMaxPathBytes = 256;   // a path for open, with its zero byte
 
 class Kernel {
 public :
+    // A disk read into the block cache (spec C2), not on behalf of one process.
+    struct CacheFill {
+        uint32_t block;
+    };
+
+    // A cache lookup that missed: block must be fetched before the call can go on.
+    struct Missing {
+        uint32_t block;
+    };
+
+    // A request in the disk queue, and whom its completion is for:
+    //   uint32_t   a user's disk_read / disk_write: wake this pid, its a0 = 0
+    //   CacheFill  the cache: the block is ready, wake everyone waiting for it
     struct PendingIO {
-        uint32_t pid;
+        std::variant<uint32_t, CacheFill> owner;
         disk::Request request;
+    };
+
+    struct OpenFile {
+        uint32_t inode{};
+        uint32_t offset{};
+        uint32_t refs{};
     };
 
     Kernel(machine::Machine& machine, std::ostream& out, std::ostream& err) : 
@@ -101,6 +130,8 @@ private :
     std::ostream& out_;
     std::ostream& err_;
     std::queue<PendingIO> pending_ios_;
+    std::array<std::optional<OpenFile>, kMaxOpenFiles> file_table_{};
+    std::unordered_map<uint32_t, CachedBlock> cached_blocks_{};
 
     std::variant<Continue, Switch> disk_io(disk::Op op);
     
@@ -112,6 +143,14 @@ private :
 
     // return false when theres no frame left on ram or the address is invalid
     bool write_memory_on_ram(uint32_t addr, std::span<uint8_t> buffer);  
+
+    std::variant<Continue, Switch> sys_read();
+
+    std::variant<Continue, Switch> sys_lseek();
+
+    Continue sys_close();
+
+    std::variant<Continue, Switch> sys_open();
 
     Exited sys_exit(); 
 
@@ -170,6 +209,9 @@ private :
         return machine_.disk();
     }
 
+    // Adds io to the FCFS disk queue, and starts it at once if the disk is idle.
+    void enqueue(PendingIO io);
+
     void start_next_request();
 
     mmu::PageTable share_table(mmu::PageTable& other);
@@ -193,6 +235,14 @@ private :
 
     void zero_frame(uint32_t frame);
 
+    std::variant<std::string, int32_t> read_user_string(uint32_t addr, uint32_t max_bytes);
+
+    // The index of the first empty open-file slot, or nullopt. Doesn't take it.
+    std::optional<uint32_t> find_free_open_file() const;
+
+    // The lowest empty fd from 3 up, or nullopt. Doesn't take it.
+    std::optional<uint32_t> find_free_fd(const Process& process) const;
+
     std::optional<uint32_t> try_access(uint32_t addr, mmu::Access access);
 
     Process* find_next_process(uint32_t last_exec);
@@ -211,6 +261,34 @@ private :
 
     std::vector<uint32_t> get_running_children_process(uint32_t parent_pid, uint32_t pid);
     std::vector<uint32_t> get_ended_children_process(uint32_t parent_pid, uint32_t pid);
+
+    Switch block_on(uint32_t b);
+    // Block b is needed but not cached: fetch it and block the caller (pc back on
+    // its ECALL), or -ENOMEM in a0 if no frame is free for it.
+    std::variant<Continue, Switch> wait_for(uint32_t b);
+    // The open-file entry the caller's fd points to, or nullptr if fd isn't an
+    // open file (out of range, 0..2, or an empty slot).
+    OpenFile* open_file_of(uint32_t fd);
+    std::optional<fs::Block> cache_get(uint32_t b);
+    bool cache_fetch(uint32_t b);
+
+    // Inode i, decoded from its inode-table block in the cache, or Missing{that block}.
+    std::variant<fs::Inode, Missing> inode_of(uint32_t i);
+
+    // The disk block number of file block k of inode (direct blocks only, k < 12).
+    // Doesn't read the block itself.
+    std::variant<uint32_t, Missing> block_of(const fs::Inode& inode, uint32_t k);
+
+    // The path walk through the cache (spec C3, open). path is absolute.
+    //   uint32_t  the inode the path names
+    //   Missing   a block the walk needs is not cached; fetch it and re-run the call
+    //   int32_t   -EINVAL, -ENOTDIR or -ENOENT
+    std::variant<uint32_t, Missing, int32_t> walk(std::string_view path);
+
+    // One more fd points to open-file entry `entry` (fork).
+    void share_open_file(uint32_t entry);
+    // One fd less points to `entry`; the entry is freed when none is left.
+    void release_open_file(uint32_t entry);
 };
 
 
