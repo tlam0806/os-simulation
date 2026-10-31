@@ -113,10 +113,7 @@ void Kernel::end_process(Process& process, std::variant<Exited, Killed> status) 
     }
     Ending ending{process.parent_pid, status, false};
     ending_table_.emplace(process.pid, ending);
-    for (uint32_t vpn : process.page_table.mapped_pages()) {
-        uint32_t frame = process.page_table.lookup(vpn)->frame;
-        frame_allocator().free(frame);
-    }
+    free_address_space(process.page_table);
     for (auto& fd : process.fd_table) {
         if (fd) {
             release_open_file(*fd);

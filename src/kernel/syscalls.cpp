@@ -38,6 +38,8 @@ std::variant<Exited, Continue, Switch> Kernel::handle_syscall() {
             return util::convert_variant<Exited, Continue, Switch>(sys_lseek());
         case abi::kSysRead : 
             return util::convert_variant<Exited, Continue, Switch>(sys_read());
+        case abi::kSysExec :
+            return util::convert_variant<Exited, Continue, Switch>(sys_exec());
         default :
             return sys_other();
     }
@@ -162,10 +164,6 @@ std::variant<Continue, Switch> Kernel::sys_wait() {
     process().blocked = kernel::BlockReason::Wait;
     cpu().pc -= 4;
     return Switch{};
-}
-
-Continue Kernel::sys_exec() {
-    return Continue{};
 }
 
 Continue Kernel::sys_other() {

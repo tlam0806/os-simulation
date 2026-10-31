@@ -13,7 +13,7 @@ inline constexpr uint32_t kSysSbrk = 3;
 inline constexpr uint32_t kSysGetpid = 4;
 inline constexpr uint32_t kSysYield = 5;
 inline constexpr uint32_t kSysFork = 6;
-inline constexpr uint32_t kSysExec = 7;   // not defined yet
+inline constexpr uint32_t kSysExec = 7;
 inline constexpr uint32_t kSysWait = 8;
 inline constexpr uint32_t kSysDiskRead = 9;
 inline constexpr uint32_t kSysDiskWrite = 10;
@@ -25,6 +25,7 @@ inline constexpr uint32_t kSysLseek = 14;
 // Error codes, using Linux's values. A failed call returns -code in a0.
 // (Not EBADF etc.: those names are macros in <errno.h>.)
 inline constexpr int32_t kEnoent = 2;   // no such file or directory
+inline constexpr int32_t kEnoexec = 8;  // not an executable file
 inline constexpr int32_t kEbadf = 9;    // bad file descriptor
 inline constexpr int32_t kEchild = 10;  // no child to wait for
 inline constexpr int32_t kEnomem = 12;  // out of memory

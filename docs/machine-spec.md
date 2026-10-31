@@ -284,7 +284,7 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 | 4 | `getpid` | — | Process ID | 4 |
 | 5 | `yield` | — | 0 | 4 |
 | 6 | `fork` | — | In the parent: the child's pid. In the child: 0 | 5 |
-| 7 | `exec` | To be defined | | 5 |
+| 7 | `exec` | `a0` = path address | Does not return (on success) | 8 |
 | 8 | `wait` | `a0` = pid to wait for (−1: any child), `a1` = address to store the status (0: don't store) | The pid of the child that ended | 5 |
 | 9 | `disk_read` | `a0` = first sector, `a1` = buffer address, `a2` = sector count | 0 | 6 |
 | 10 | `disk_write` | `a0` = first sector, `a1` = buffer address, `a2` = sector count | 0 | 6 |
@@ -293,7 +293,7 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 | 13 | `read` | `a0` = fd, `a1` = buffer address, `a2` = byte count | Bytes read | 7 |
 | 14 | `lseek` | `a0` = fd, `a1` = offset, `a2` = whence | The new offset | 7 |
 
-For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (11–14) are described in C3.
+For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (11–14) and `exec` (7) are described in C3.
 
 `sbrk` returns `-EINVAL` if the new break would be below the initial break, and `-ENOMEM` if it would be above `0x7FF00000`. Otherwise it always succeeds: it maps nothing (see B1). Shrinking unmaps the heap pages the heap no longer covers; each of their frames is freed once no other mapping uses it (see `fork`).
 
@@ -331,6 +331,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (
 | Name | Value | Meaning |
 |---|---|---|
 | `ENOENT` | 2 | No such file or directory |
+| `ENOEXEC` | 8 | Not an executable file |
 | `EBADF` | 9 | Bad file descriptor |
 | `ECHILD` | 10 | No child to wait for |
 | `ENOMEM` | 12 | Out of memory |
@@ -345,7 +346,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (
 **Rules:**
 
 - An unknown system call number returns `-ENOSYS`. The process is not killed.
-- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. If no frame is free for it, the call returns `-EFAULT`. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed calls are a blocked `wait` and a file-system call blocked on a missing block (C2), which had none; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
+- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. If no frame is free for it, the call returns `-EFAULT`. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed calls are a blocked `wait` and a file-system call or `exec` blocked on a missing block (C2), which had none; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
 
 ---
 
@@ -457,6 +458,16 @@ Running the call again is safe because the look phase changed nothing. The call 
 - **`read(fd, buffer, count)`** copies bytes from the file, starting at the entry's offset, to the buffer, and moves the offset forward by as many. It returns how many it copied: `min(count, size − offset)`, but **never past the end of the block the offset is in**, so one call needs at most one data block. A shorter count than asked for is not an error (as in Unix); 0 means the offset is at the end of the file. Errors: `-EBADF` if fd isn't an open file; `-EFAULT` if the bytes to be copied don't fit in writable user memory (checked like `write`'s buffer, before anything is copied, so the offset doesn't move).
 - **`close(fd)`** empties the fd slot and returns 0; the open-file entry is freed if nothing else points to it. `-EBADF` if fd isn't an open file. It never blocks.
 - **`lseek(fd, offset, whence)`** sets the entry's offset to `offset` (`whence` 0), the current offset + `offset` (1), or the file's size + `offset` (2), with `offset` a signed 32-bit number, and returns the new offset. `-EBADF` if fd isn't an open file, `-EINVAL` if `whence` is something else or the result would be negative or above `0x7FFFFFFF`. The offset may go past the end: `read` then returns 0. `whence` 2 needs the inode, so it may block.
+
+**`exec(path)`** (L2b, "exec"): replaces the caller's program with the executable file at `path`. It is the same process afterwards: only its memory and registers are new.
+
+- **Look phase.** The path is read and walked exactly like `open`'s, with the same errors in the same order (`-EFAULT`, `-ENAMETOOLONG`, `-EINVAL`, `-ENOTDIR`, `-ENOENT`). Then `-ENOEXEC` if it names a directory. Then every block of the file is fetched through the cache: its inode, its indirect block if it has one, and each data block in file order. Each miss blocks the caller and re-runs the `ECALL` (C2), so a big file can take many re-runs. `-ENOMEM` if the cache can't get a frame for a block.
+- **Loading.** Once every block is cached, the kernel copies the file's bytes out of the cache and loads them into a **new**, empty address space (B2's loader). If the loader rejects the file (not an ELF executable, a bad segment, or not enough free frames), `exec` returns `-ENOEXEC` and nothing else has changed: the old program goes on after its `ECALL`. (Linux would say `-ENOMEM` for the last case; one code keeps it simple.)
+- **Act phase**, only after loading succeeded; nothing can fail any more:
+  - The old address space is dropped like at `exit`: each page is unmapped, and its frame is freed once no other mapping uses it (copy-on-write sharing with a parent or child, see `fork`).
+  - The process gets the new address space, `pc` = the entry point, `sp` = `0x80000000`, every other register 0, and the new program's initial break.
+  - It **keeps** its pid, its parent, its children, and its fd table: open files stay open, with their offsets (as in Unix). That is how a shell passes files to the program it runs.
+- `exec` does not return on success: the old program's code is gone. Blocks the file brought into the cache stay there.
 
 ---
 

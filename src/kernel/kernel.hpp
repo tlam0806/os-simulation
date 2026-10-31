@@ -144,6 +144,8 @@ private :
     // return false when theres no frame left on ram or the address is invalid
     bool write_memory_on_ram(uint32_t addr, std::span<uint8_t> buffer);  
 
+    std::variant<Continue, Switch> sys_exec();
+
     std::variant<Continue, Switch> sys_read();
 
     std::variant<Continue, Switch> sys_lseek();
@@ -161,8 +163,6 @@ private :
     Continue sys_fork();
 
     std::variant<Continue, Switch> sys_wait();
-
-    Continue sys_exec();
 
     Continue sys_other(); 
 
@@ -285,10 +285,18 @@ private :
     //   int32_t   -EINVAL, -ENOTDIR or -ENOENT
     std::variant<uint32_t, Missing, int32_t> walk(std::string_view path);
 
+    // Reads the path at user address addr and walks it: the same three results as
+    // walk, plus -EFAULT / -ENAMETOOLONG from reading the path.
+    std::variant<uint32_t, Missing, int32_t> resolve_user_path(uint32_t addr);
+
     // One more fd points to open-file entry `entry` (fork).
     void share_open_file(uint32_t entry);
     // One fd less points to `entry`; the entry is freed when none is left.
     void release_open_file(uint32_t entry);
+
+    std::variant<std::vector<uint8_t>, Missing> file_bytes(const fs::Inode& inode);
+
+    void free_address_space(mmu::PageTable& table);
 };
 
 

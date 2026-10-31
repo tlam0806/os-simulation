@@ -11,28 +11,15 @@ namespace kernel {
 
 std::variant<Continue, Switch> Kernel::sys_open() {
     uint32_t addr = cpu().reg(isa::reg::a0);
-    std::variant<std::string, int32_t> result = read_user_string(addr, kMaxPathBytes);
-    if (std::holds_alternative<int32_t>(result)) {
-        int32_t error_code = std::get<int32_t>(result);
-        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(error_code));
-        return Continue{};
-    }
-    std::string path = std::get<std::string>(result);
-    if (path.empty() || path[0] != '/') {
-        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
-        return Continue{};
-    }
-
-    auto found = walk(path);
-    if (auto missing = std::get_if<Missing>(&found)) {
-        return wait_for(missing->block);
-    }
-    if (auto error = std::get_if<int32_t>(&found)) {
+    std::variant<uint32_t, Missing, int32_t> result = resolve_user_path(addr);
+    if (auto error = std::get_if<int32_t>(&result)) {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(*error));
         return Continue{};
     }
-    auto inode = std::get<uint32_t>(found);
-    
+    if (auto missing = std::get_if<Missing>(&result)) {
+        return wait_for(missing->block);
+    }
+    auto inode_index = std::get<uint32_t>(result);
     auto fd = find_free_fd(process());
     if (!fd) {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEmfile));
@@ -44,7 +31,7 @@ std::variant<Continue, Switch> Kernel::sys_open() {
         return Continue{};
     }
 
-    file_table_[*open_file] = OpenFile{.inode = inode, .offset = 0, .refs = 1};
+    file_table_[*open_file] = OpenFile{.inode = inode_index, .offset = 0, .refs = 1};
     process().fd_table[*fd] = *open_file;
     cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(*fd));
     return Continue{};
@@ -156,6 +143,47 @@ std::variant<Continue, Switch> Kernel::sys_read() {
     }
     cpu().set_reg(isa::reg::a0, bytes_to_read);
     file->offset += bytes_to_read;
+    return Continue{};
+}
+
+std::variant<Continue, Switch> Kernel::sys_exec() {
+    auto found = resolve_user_path(cpu().reg(isa::reg::a0));
+    if (auto error = std::get_if<int32_t>(&found)) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(*error));
+        return Continue{};
+    }
+    if (auto missing = std::get_if<Missing>(&found)) {
+        return wait_for(missing->block);
+    }
+    auto inode_index = std::get<uint32_t>(found);
+    auto found_inode = inode_of(inode_index);
+    if (auto missing = std::get_if<Missing>(&found_inode)) {
+        return wait_for(missing->block);
+    }
+    const fs::Inode& inode = std::get<fs::Inode>(found_inode);
+    if (inode.type == fs::InodeType::directory) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnoexec));
+        return Continue{};
+    }
+    auto gathered_bytes = file_bytes(inode);
+    if (auto missing = std::get_if<Missing>(&gathered_bytes)) {
+        return wait_for(missing->block);
+    }
+    mmu::PageTable fresh;
+    const std::vector<uint8_t>& elf_bytes = std::get<std::vector<uint8_t>>(gathered_bytes);
+    auto loaded = loader::load_elf(elf_bytes, ram(), frame_allocator(), fresh);
+    if (auto error = std::get_if<std::string>(&loaded)) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnoexec));
+        return Continue{};
+    }
+    free_address_space(process().page_table);
+    page_table() = std::move(fresh);
+    const auto& program = std::get<loader::Program>(loaded);
+    process().brk = process().initial_break = program.initial_break;
+    process().context = {};
+    process().context.pc = program.entry;
+    process().context.regs[isa::reg::sp] = static_cast<uint32_t>(loader::kStackTop);
+    cpu().set_context(process().context);
     return Continue{};
 }
 
@@ -314,6 +342,40 @@ std::variant<uint32_t, Kernel::Missing> Kernel::block_of(const fs::Inode& inode,
         return Missing{.block = inode.indirect};
     }
     return util::get32(*indirect_block, (k - fs::kNumDirect) * 4);
+}
+
+std::variant<uint32_t, Kernel::Missing, int32_t> Kernel::resolve_user_path(uint32_t addr) {
+    std::variant<std::string, int32_t> path = read_user_string(addr, kMaxPathBytes);
+    if (auto error = std::get_if<int32_t>(&path)) {
+        return *error;
+    }
+    return walk(std::get<std::string>(path));
+}
+
+std::variant<std::vector<uint8_t>, Kernel::Missing> Kernel::file_bytes(const fs::Inode& inode) {
+    std::vector<uint8_t> bytes;
+    bytes.reserve(inode.size);
+    for (uint32_t k = 0; k * fs::kBlockSize < inode.size; ++k) {
+        auto block_num_variant = block_of(inode, k);
+        if (auto missing = std::get_if<Missing>(&block_num_variant)) {
+            return *missing;
+        }
+        uint32_t block_num = std::get<uint32_t>(block_num_variant);
+        auto block = cache_get(block_num);
+        if (!block) {
+            return Missing{.block = block_num};
+        }
+        uint32_t bytes_to_copy = std::min(fs::kBlockSize, inode.size - k * fs::kBlockSize);
+        bytes.insert(bytes.end(), block->begin(), block->begin() + bytes_to_copy);
+    }
+    return bytes;
+}
+
+void Kernel::free_address_space(mmu::PageTable& table) {
+    for (uint32_t vpn : table.mapped_pages()) {
+        uint32_t frame = table.lookup(vpn)->frame;
+        frame_allocator().free(frame);
+    }
 }
 
 }  // namespace kernel
