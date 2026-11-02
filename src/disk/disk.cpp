@@ -134,10 +134,15 @@ void Disk::complete(mem::Ram& ram) {
             std::copy(data->begin(), data->end(), sectors_[sector].begin());
         }
     }
+    completed_.push_back(current_request_);
     busy_ = false;
     head_track_ = place_of(current_request_.first_sector + current_request_.count - 1).track;
     completion_time_ = 0;
     current_request_ = {};
+}
+
+const std::vector<Request>& Disk::completed() const {
+    return completed_;
 }
 
 }  // namespace disk

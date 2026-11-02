@@ -27,6 +27,12 @@ struct Continue {
 struct Switch {
 };
 
+struct Blocked {
+};
+
+struct Fault {
+};
+
 // How a process ended.
 // using Ending = std::variant<Exited, Killed>;
 
@@ -62,11 +68,35 @@ public :
         uint32_t block;
     };
 
+    struct SwapOut {
+        uint32_t pid; 
+        uint32_t frame; 
+    };
+
+    struct SwapIn {
+        uint32_t pid;
+        uint32_t vpn;
+        uint32_t frame;
+    };
+
+    struct Victim {
+        uint32_t frame;
+        uint32_t pid;
+        uint32_t vpn;
+    };
+
+    struct FrameOwner {
+        uint32_t pid;
+        uint32_t vpn;
+    };
+
     // A request in the disk queue, and whom its completion is for:
     //   uint32_t   a user's disk_read / disk_write: wake this pid, its a0 = 0
+    //   SwapOut    a swap-out: wake the process, its a0 = 0
+    //   SwapIn     a swap-in: wake the process, its a0 = 0
     //   CacheFill  the cache: the block is ready, wake everyone waiting for it
     struct PendingIO {
-        std::variant<uint32_t, CacheFill> owner;
+        std::variant<uint32_t, CacheFill, SwapOut, SwapIn> owner;
         disk::Request request;
     };
 
@@ -74,6 +104,12 @@ public :
         uint32_t inode{};
         uint32_t offset{};
         uint32_t refs{};
+    };
+
+    enum class EvictResult {
+        Freed,
+        Blocked, 
+        Failed
     };
 
     Kernel(machine::Machine& machine, std::ostream& out, std::ostream& err) : 
@@ -122,16 +158,19 @@ public :
     std::optional<Ending> ending(uint32_t pid) const;
     
 private : 
-    uint32_t executing_pid{};
+    uint32_t executing_pid_{};
     uint32_t next_pid_{};
     std::map<uint32_t, Process> process_table_{};
     std::map<uint32_t, Ending> ending_table_{};
     machine::Machine& machine_;
     std::ostream& out_;
     std::ostream& err_;
-    std::queue<PendingIO> pending_ios_;
+    std::deque<PendingIO> pending_ios_;
     std::array<std::optional<OpenFile>, kMaxOpenFiles> file_table_{};
     std::unordered_map<uint32_t, CachedBlock> cached_blocks_{};
+    std::array<uint32_t, fs::kSwapBlocks> slot_refs_{};
+    uint32_t clock_hand_{};
+
 
     std::variant<Continue, Switch> disk_io(disk::Op op);
     
@@ -139,10 +178,7 @@ private :
     
     std::variant<Exited, Continue, Switch> handle_syscall();
 
-    std::optional<std::vector<uint8_t>> read_memory_on_ram(uint32_t addr, uint32_t bytes_count); 
-
-    // return false when theres no frame left on ram or the address is invalid
-    bool write_memory_on_ram(uint32_t addr, std::span<uint8_t> buffer);  
+    std::variant<std::vector<uint8_t>, Blocked, Fault> read_memory_on_ram(uint32_t addr, uint32_t bytes_count); 
 
     std::variant<Continue, Switch> sys_exec();
 
@@ -156,7 +192,7 @@ private :
 
     Exited sys_exit(); 
 
-    Continue sys_write(); 
+    std::variant<Continue, Switch> sys_write(); 
 
     Continue sys_sbrk(); 
 
@@ -172,7 +208,7 @@ private :
 
     std::variant<Continue, Switch> sys_disk_write();
 
-    std::variant<Killed, Continue> handle_page_fault(const cpu::Trap& trap);
+    std::variant<Killed, Continue, Switch> handle_page_fault(const cpu::Trap& trap);
 
     Continue handle_disk_interrupt();
 
@@ -186,22 +222,26 @@ private :
         return machine_.cpu();
     }
 
+    const cpu::Cpu& cpu() const {
+        return machine_.cpu();
+    }
+
     Process& process() {  // context is not up to date when the process is running, needs to load again
-        return process_table_.find(executing_pid)->second;
+        return process_table_.find(executing_pid_)->second;
     }
 
     uint32_t current_break() {
-        Process& process = process_table_.find(executing_pid)->second;
+        Process& process = process_table_.find(executing_pid_)->second;
         return process.brk;
     }
 
     uint32_t initial_break() {
-        Process& process = process_table_.find(executing_pid)->second;
+        Process& process = process_table_.find(executing_pid_)->second;
         return process.initial_break;
     }
 
     mmu::PageTable& page_table() {
-        Process& process = process_table_.find(executing_pid)->second;
+        Process& process = process_table_.find(executing_pid_)->second;
         return process.page_table;
     }
 
@@ -219,11 +259,15 @@ private :
     void copy_frame(uint32_t old_frame, uint32_t new_frame);
 
     const mmu::PageTable& page_table() const {
-        const Process& process = process_table_.find(executing_pid)->second;
+        const Process& process = process_table_.find(executing_pid_)->second;
         return process.page_table;
     }
 
     mmu::FrameAllocator& frame_allocator() {
+        return machine_.frame_allocator();
+    }
+
+    const mmu::FrameAllocator& frame_allocator() const {
         return machine_.frame_allocator();
     }
 
@@ -235,7 +279,7 @@ private :
 
     void zero_frame(uint32_t frame);
 
-    std::variant<std::string, int32_t> read_user_string(uint32_t addr, uint32_t max_bytes);
+    std::variant<std::string, int32_t, Blocked> read_user_string(uint32_t addr, uint32_t max_bytes);
 
     // The index of the first empty open-file slot, or nullopt. Doesn't take it.
     std::optional<uint32_t> find_free_open_file() const;
@@ -243,7 +287,7 @@ private :
     // The lowest empty fd from 3 up, or nullopt. Doesn't take it.
     std::optional<uint32_t> find_free_fd(const Process& process) const;
 
-    std::optional<uint32_t> try_access(uint32_t addr, mmu::Access access);
+    std::variant<uint32_t, Blocked, Fault> try_access(uint32_t addr, mmu::Access access);
 
     Process* find_next_process(uint32_t last_exec);
 
@@ -263,6 +307,10 @@ private :
     std::vector<uint32_t> get_ended_children_process(uint32_t parent_pid, uint32_t pid);
 
     Switch block_on(uint32_t b);
+
+    // A user page the call needs is on its way (D7): re-run the ECALL once it arrives.
+    // evict / swap_in have already blocked the process.
+    Switch retry_call();
     // Block b is needed but not cached: fetch it and block the caller (pc back on
     // its ECALL), or -ENOMEM in a0 if no frame is free for it.
     std::variant<Continue, Switch> wait_for(uint32_t b);
@@ -286,8 +334,9 @@ private :
     std::variant<uint32_t, Missing, int32_t> walk(std::string_view path);
 
     // Reads the path at user address addr and walks it: the same three results as
-    // walk, plus -EFAULT / -ENAMETOOLONG from reading the path.
-    std::variant<uint32_t, Missing, int32_t> resolve_user_path(uint32_t addr);
+    // walk, plus -EFAULT / -ENAMETOOLONG from reading the path, or Blocked while a page
+    // of the path is swapped in.
+    std::variant<uint32_t, Missing, int32_t, Blocked> resolve_user_path(uint32_t addr);
 
     // One more fd points to open-file entry `entry` (fork).
     void share_open_file(uint32_t entry);
@@ -297,6 +346,18 @@ private :
     std::variant<std::vector<uint8_t>, Missing> file_bytes(const fs::Inode& inode);
 
     void free_address_space(mmu::PageTable& table);
+
+    std::optional<Victim> choose_victim();
+
+    std::optional<uint32_t> alloc_slot();
+
+    bool fault_needs_frame(const std::optional<mmu::Pte>& found, const cpu::Trap& trap) const;
+
+    EvictResult evict();
+
+    void swap_in(uint32_t vpn, const mmu::Pte& pte);
+
+    void drop_entry(const mmu::Pte&);
 };
 
 

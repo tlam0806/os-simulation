@@ -91,6 +91,11 @@ public:
     // Must only be called while busy.
     void complete(mem::Ram& ram);
 
+    // ---- for tests: what the disk has done (changes nothing) ----
+
+    // Every request completed so far, oldest first.
+    const std::vector<Request>& completed() const;
+
 private:
     // TODO: your data members. Hint: 64 MiB is a lot to allocate for every
     // Disk a test creates; most tests touch only a few sectors.
@@ -99,6 +104,7 @@ private:
     uint64_t completion_time_ = 0;
     uint32_t head_track_ = 0;
     bool busy_ = false;
+    std::vector<Request> completed_;
 };
 
 }  // namespace disk

@@ -31,6 +31,9 @@ inline constexpr uint32_t kBitmapBlock = 1;
 inline constexpr uint32_t kInodeStart = 2;
 inline constexpr uint32_t kInodeBlocks = 16;
 inline constexpr uint32_t kDataStart = kInodeStart + kInodeBlocks;          // 18
+// The swap area (spec D1): the last kSwapBlocks blocks, one page per block ("slot").
+inline constexpr uint32_t kSwapBlocks = 512;
+inline constexpr uint32_t kSwapStart = kNumBlocks - kSwapBlocks;           // 15872
 
 inline constexpr uint32_t kInodeSize = 64;
 inline constexpr uint32_t kInodesPerBlock = kBlockSize / kInodeSize;        // 64
@@ -124,7 +127,8 @@ bool write_inode(disk::Disk& d, uint32_t i, const Inode& inode);
 
 // Makes an empty file system (C1), whatever the disk held before:
 //   - the superblock
-//   - the bitmap: blocks 0..kDataStart-1 in use, everything else free
+//   - the bitmap: blocks 0..kDataStart-1 and the swap area (kSwapStart..) in use,
+//     everything else free
 //   - the inode table: every inode free, except the root (inode 1): an empty
 //     directory, size 0, no blocks, links 1
 // Data blocks are left as they were: they are free, so nobody reads them.

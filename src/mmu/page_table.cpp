@@ -25,13 +25,16 @@ uint32_t get_vpn(uint32_t vaddr) {
     return vaddr >> kPageShift;
 }
 
-std::optional<uint32_t> translate(const PageTable& table, uint32_t vaddr, Access access) {
+std::optional<uint32_t> translate(PageTable& table, uint32_t vaddr, Access access) {
     uint32_t vpn = vaddr >> kPageShift;
     std::optional<Pte> lookup_result = table.lookup(vpn);
     if (!lookup_result) {
         return std::nullopt;
     }
     Pte pte = *lookup_result;
+    if (pte.valid == false) {
+        return std::nullopt;
+    }
     if (access == Access::fetch && pte.exec == false) {
         return std::nullopt;
     }
@@ -41,6 +44,11 @@ std::optional<uint32_t> translate(const PageTable& table, uint32_t vaddr, Access
     if (access == Access::store && pte.write == false) {
         return std::nullopt;
     }
+    pte.accessed = true;
+    if (access == Access::store) {
+        pte.dirty = true;
+    }
+    table.map(vpn, pte);
     uint32_t frame = pte.frame;
     uint32_t offset = vaddr & 0xFFF;
     return (frame << kPageShift) | offset;

@@ -27,7 +27,7 @@ using fs::InodeType;
 namespace {
 
 constexpr uint32_t kRoot = fs::kRootInode;
-constexpr uint32_t kFreshFreeBlocks = fs::kNumBlocks - fs::kDataStart;   // 16366
+constexpr uint32_t kFreshFreeBlocks = fs::kNumBlocks - fs::kDataStart - fs::kSwapBlocks;   // 15854: the swap area is in use (D1)
 constexpr uint32_t kFreshFreeInodes = fs::kNumInodes - 2;                // 1022: not 0, not the root
 
 // A formatted disk.

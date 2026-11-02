@@ -187,6 +187,9 @@ void format(disk::Disk& disk) {
     for (uint32_t i = 0; i < kDataStart; ++i) {
         bitmap_block[i / 8] |= 1 << (i % 8);
     }
+    for (uint32_t i = kSwapStart; i < kNumBlocks; ++i) {
+        bitmap_block[i / 8] |= 1 << (i % 8);
+    }
     write_block(disk, kBitmapBlock, bitmap_block);
 
     

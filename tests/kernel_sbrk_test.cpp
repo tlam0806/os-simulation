@@ -11,7 +11,8 @@
 //   - The break can't go below initial_break (-EINVAL) or past the stack
 //     region at 0x7ff00000 (-ENOMEM). On those errors nothing changes.
 //   - Otherwise sbrk always succeeds, even beyond RAM (overcommit): running out
-//     of frames shows up later, as a page fault that kills the process.
+//     of frames shows up later, as page faults that swap pages out (D4); a
+//     process is killed only when swap is full too (swap_test.cpp).
 #include <cstdint>
 #include <variant>
 #include <vector>
@@ -234,25 +235,6 @@ TEST(sbrk_more_than_ram_succeeds) {
     a.emit({LW, a0, s0, 0, 0});
     a.exit_with_a0();
     CHECK_EQ(exit_status(run(m, a)), 5);
-}
-
-TEST(sbrk_touching_more_than_ram_kills) {
-    // The heap is bigger than RAM; touching page after page eventually finds no
-    // free frame. That access is a page fault the kernel can't fix: the process
-    // is killed, and every frame it had comes back.
-    machine::Machine m;
-    Asm a;
-    a.sbrk(0x100000);                // 256 pages
-    a.emit({ADDI, t0, a0, 0, 0});
-    a.li(t1, 4096);
-    const size_t loop = a.here();
-    a.emit({SW, 0, t0, zero, 0});
-    a.emit({ADD, t0, t0, t1, 0});
-    a.patch(a.branch(JAL, zero, zero), loop);   // until killed
-    const cpu::Trap t = killed_by(run(m, a));
-    CHECK_EQ(t.cause, cpu::Cause::store_page_fault);
-    CHECK(t.tval >= kInitialBreak && t.tval < kInitialBreak + 0x100000);   // inside the heap
-    CHECK_EQ(m.frame_allocator().free_count(), mmu::kNumFrames);
 }
 
 TEST(sbrk_into_stack_region_returns_enomem) {

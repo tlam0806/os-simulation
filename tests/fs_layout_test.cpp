@@ -291,6 +291,7 @@ TEST(fs_format_superblock) {
 
 TEST(fs_format_bitmap_marks_the_metadata_blocks) {
     // Blocks 0..17 in use: bytes 0 and 1 are 0xFF, byte 2 has bits 0 and 1.
+    // The swap area, blocks 15872..16383 (spec D1), is in use too: bytes 1984..2047.
     disk::Disk d;
     fs::format(d);
     const auto b = fs::read_block(d, fs::kBitmapBlock);
@@ -299,10 +300,20 @@ TEST(fs_format_bitmap_marks_the_metadata_blocks) {
         CHECK_EQ((*b)[0], 0xFFu);
         CHECK_EQ((*b)[1], 0xFFu);
         CHECK_EQ((*b)[2], 0x03u);
-        bool rest_zero = true;
-        for (size_t i = 3; i < b->size(); i++) rest_zero = rest_zero && (*b)[i] == 0;
-        CHECK(rest_zero);
+        bool data_free = true, swap_used = true, past_end_zero = true;
+        for (size_t i = 3; i < 1984; i++) data_free = data_free && (*b)[i] == 0;
+        for (size_t i = 1984; i < 2048; i++) swap_used = swap_used && (*b)[i] == 0xFF;
+        for (size_t i = 2048; i < b->size(); i++) past_end_zero = past_end_zero && (*b)[i] == 0;
+        CHECK(data_free);
+        CHECK(swap_used);
+        CHECK(past_end_zero);
     }
+}
+
+TEST(fs_format_swap_area_constants) {
+    CHECK_EQ(fs::kSwapBlocks, 512u);
+    CHECK_EQ(fs::kSwapStart, 15872u);
+    CHECK_EQ(fs::kSwapStart + fs::kSwapBlocks, fs::kNumBlocks);
 }
 
 TEST(fs_format_root_is_an_empty_directory) {

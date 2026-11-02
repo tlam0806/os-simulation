@@ -414,7 +414,7 @@ TEST(cow_share_fork_succeeds_with_no_frame_to_copy) {
 // =================== copy-on-write, step 3: a store copies the page ===================
 // A store to a cow page is a store page fault. Frame still shared: copy it into
 // a new frame, map that read+write for the writer, retry. Last user: just make
-// it read+write. No free frame: the writer is killed.
+// it read+write. No free frame: the kernel evicts a page for the copy (D4).
 
 namespace {
 
@@ -559,10 +559,11 @@ TEST(cow_write_both_write_then_frames_balance) {
     CHECK_EQ(s.m.frame_allocator().free_count(), before);
 }
 
-TEST(cow_write_no_free_frame_kills_the_writer) {
+TEST(cow_write_no_free_frame_evicts_for_the_copy) {
     // 15 processes x 17 frames + 1 heap page = all 256 frames. After fork the
-    // child stores to the stack: there is no frame for the copy, so it is
-    // killed by the store page fault. The parent is unaffected.
+    // child stores to the stack: there is no free frame for the copy, so the
+    // kernel evicts a page to make one, and the child goes on. The parent is
+    // unaffected.
     System s;
     Asm forker;
     forker.sbrk(4096);
@@ -571,7 +572,7 @@ TEST(cow_write_no_free_frame_kills_the_writer) {
     forker.syscall(SYS_YIELD);
     forker.exit_with(0);                    // parent: no store
     forker.patch(to_child, forker.here());
-    forker.emit({SW, 0, sp, zero, -4});     // needs a copy: none left
+    forker.emit({SW, 0, sp, zero, -4});     // needs a copy: evicts for it
     forker.exit_with(1);
     const uint32_t pid = s.spawn(elf(forker));
     Asm idle;
@@ -579,7 +580,7 @@ TEST(cow_write_no_free_frame_kills_the_writer) {
     idle.exit_with(0);
     for (int i = 0; i < 14; i++) s.spawn(elf(idle));
     s.run();
-    CHECK(killed_by_store_fault(s, 16));
+    CHECK_EQ(s.status(16), 1);
     CHECK_EQ(s.status(pid), 0);
     CHECK_EQ(s.m.frame_allocator().free_count(), mmu::kNumFrames);   // nothing leaked
 }

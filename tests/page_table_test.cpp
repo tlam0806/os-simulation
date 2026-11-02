@@ -26,7 +26,7 @@ Pte perms(uint32_t frame, bool r, bool w, bool x) { return {frame, r, w, x}; }
 
 // translate() as a plain number: the physical address, or kFault for a page fault.
 constexpr int64_t kFault = -1;
-int64_t phys(const mmu::PageTable& t, uint32_t vaddr, Access a) {
+int64_t phys(mmu::PageTable& t, uint32_t vaddr, Access a) {
     const std::optional<uint32_t> p = mmu::translate(t, vaddr, a);
     return p ? int64_t{*p} : kFault;
 }

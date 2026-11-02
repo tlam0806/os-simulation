@@ -37,6 +37,7 @@ add_library(ossim_core
   src/kernel/memory.cpp
   src/kernel/disk_driver.cpp
   src/kernel/file_system.cpp
+  src/kernel/clock.cpp
   src/mmu/page_table.cpp
   src/mmu/frame_allocator.cpp
   src/disk/disk.cpp
@@ -88,6 +89,9 @@ add_executable(ossim_tests
   tests/kernel_read_test.cpp
   tests/kernel_fork_files_test.cpp
   tests/kernel_exec_test.cpp
+  tests/mmu_bits_test.cpp
+  tests/clock_test.cpp
+  tests/swap_test.cpp
 )
 target_link_libraries(ossim_tests PRIVATE ossim_core)
 add_test(NAME ossim_tests COMMAND ossim_tests)

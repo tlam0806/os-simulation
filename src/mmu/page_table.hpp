@@ -24,6 +24,10 @@ struct Pte {
     bool exec = false;    // X: instruction fetches allowed
     bool cow = false;     // copy-on-write: kernel-only mark, the MMU ignores it.
                           // The page is shared after fork and was writable before.
+    bool accessed = false;   // A: set by translate on any access that succeeds (spec A2)
+    bool dirty = false;      // D: set by translate on a store that succeeds
+    bool valid = true;       // V: in RAM, in `frame`. Clear: every access faults (spec D2)
+    std::optional<uint32_t> swap_slot;   // kernel-only: the swap slot holding a copy (spec D2)
 
     bool operator==(const Pte&) const = default;
 };
@@ -49,7 +53,10 @@ private:
 // Translates `vaddr` for one kind of access.
 // Returns the physical address, or nullopt (a page fault) if the page is not
 // mapped or its permission bit for this access is not set.
-std::optional<uint32_t> translate(const PageTable& table, uint32_t vaddr, Access access);
+// On success it sets the entry's accessed bit, and for a store its dirty bit
+// too (spec A2); a fault changes nothing. An entry with `valid` clear always
+// faults (spec D2).
+std::optional<uint32_t> translate(PageTable& table, uint32_t vaddr, Access access);
 
 uint32_t get_vpn(uint32_t vaddr);
 

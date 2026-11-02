@@ -26,6 +26,7 @@ std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Tr
             return Switch{};
         case cpu::Cause::load_page_fault :
         case cpu::Cause::store_page_fault : 
+        case cpu::Cause::instruction_page_fault :
             return util::convert_variant<Exited, Killed, Continue, Switch>(handle_page_fault(trap));
         default :
             return Killed{trap};   // any fault ends the process
@@ -146,14 +147,14 @@ void Kernel::save_process(Process& process) {
 }
 
 void Kernel::load_process(Process& process) {
-    executing_pid = process.pid;
+    executing_pid_ = process.pid;
     cpu().set_context(process.context);
     cpu().set_page_table(&process.page_table);
 }
 
 // Runs the next process for one turn; returns how many of max_steps are left.
 uint64_t Kernel::run_helper(uint64_t max_steps) {
-    Process* maybe_process = find_next_process(executing_pid);
+    Process* maybe_process = find_next_process(executing_pid_);
     if (!maybe_process) { // every process is blocked: wait for an interrupt
         uint64_t old_steps = machine_.steps();
         machine_.set_timer(machine_.steps() + max_steps);
@@ -210,5 +211,6 @@ std::variant<AllDone, StepLimit> Kernel::run_all(uint64_t max_steps) {
     assert(max_steps == 0);
     return StepLimit{};
 }
+
 
 }  // namespace kernel

@@ -87,6 +87,17 @@ Each page mapping holds a frame number and these permission bits:
 
 An access to an unmapped page, or one its permissions don't allow, raises the matching page fault (fetch, load or store; see A3).
 
+Each mapping also holds two status bits that the **MMU writes** and the kernel reads (L9, "reference bit" and "dirty bit"; they are what page replacement needs):
+
+| Bit | Name | Set by the MMU when |
+|---|---|---|
+| A | Accessed | any access to the page succeeds: fetch, load or store |
+| D | Dirty | a store to the page succeeds |
+
+- Only successful translations set them: an access that page-faults changes no bit.
+- The MMU only ever **sets** them. Only the kernel clears them (page replacement, Part D). A new mapping (the loader, a lazily mapped heap or stack page, a copy-on-write copy) starts with both clear, even though the kernel has just written the frame: the kernel writes frames by physical address, not through the MMU.
+- The kernel's own accesses to user memory through a user address (B3 Rules: `write`'s buffer, `read`'s buffer, `wait`'s status, the path of `open`, the buffer checked by `disk_read` and `disk_write`) go through the same translation, so they set the bits too. A kernel write into a user buffer makes that page dirty: otherwise page replacement could throw away bytes that `read` put there. A `disk_read` buffer is dirty from the moment it is checked, since the disk (DMA) will write the frame without the MMU.
+
 **Page tables live in host memory, not in simulated RAM** (decided in Milestone 3). Each address space is a C++ table from virtual page number to mapping, owned by the kernel. Simulated RAM holds only program code and data, so all 256 frames are available to programs. Real RISC-V (Sv32) stores page tables in RAM and walks them in hardware; we skip that, because our kernel is C++ and doesn't need to.
 
 Translation of an address `vaddr` for an access (fetch, load or store):
@@ -94,6 +105,7 @@ Translation of an address `vaddr` for an access (fetch, load or store):
 1. Look up the virtual page number `vaddr >> 12`. No entry → page fault.
 2. Check the permission bit for the access: X for fetch, R for load, W for store. Not set → page fault.
 3. The physical address is `frame * 4096 + (vaddr & 0xFFF)`.
+4. Set A in the mapping, and for a store also D.
 
 ## A3. Traps
 
@@ -242,7 +254,7 @@ Outside the simulated machine, the simulator (and tests) can read and write the 
 - **User addresses are below `0x80000000`.** The upper half is reserved, so any access to it faults.
 - **Null guard:** `0x00000000`–`0x0000FFFF` is never mapped, so a null-pointer access faults.
 - **Stack:** the initial `sp` is `0x80000000`, which meets the RISC-V ABI's 16-byte alignment rule. The stack region is `0x7FF00000`–`0x7FFFFFFF`. The loader maps the top 16 pages (64 KiB) read+write. The rest of the region is mapped **on demand**: a load or store page fault at an unmapped stack address makes the kernel map a zero-filled read+write page and retry the instruction. A fault anywhere else, a permission fault (except a store to a copy-on-write page, see `fork` in B3), or a fault when no frame is free kills the process (a *segmentation fault*).
-- **Heap:** the initial break is the end of the highest loaded segment, rounded up to 4 KiB. It moves with `sbrk` and cannot grow past `0x7FF00000`. Heap pages are mapped **lazily**: `sbrk` only moves the break, and a page from the initial break up to the page holding the last heap byte is mapped (zero-filled, read+write) the first time it is accessed, like the stack. If no frame is free at that moment, the process is killed: a successful `sbrk` does not guarantee memory (*overcommit*).
+- **Heap:** the initial break is the end of the highest loaded segment, rounded up to 4 KiB. It moves with `sbrk` and cannot grow past `0x7FF00000`. Heap pages are mapped **lazily**: `sbrk` only moves the break, and a page from the initial break up to the page holding the last heap byte is mapped (zero-filled, read+write) the first time it is accessed, like the stack. If no frame is free at that moment, the kernel evicts a page to make room (D4), and the process is killed only if it can't: a successful `sbrk` does not guarantee memory (*overcommit*).
 - **New pages are always zero-filled**, so a process can never see another process's old data.
 
 ## B2. Program format and loading
@@ -346,7 +358,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (
 **Rules:**
 
 - An unknown system call number returns `-ENOSYS`. The process is not killed.
-- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. If no frame is free for it, the call returns `-EFAULT`. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed calls are a blocked `wait` and a file-system call or `exec` blocked on a missing block (C2), which had none; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
+- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. A page that needs a frame when none is free, or that is swapped out, is handled as in D7. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed calls are a blocked `wait`, a file-system call or `exec` blocked on a missing block (C2), and a call that waited for one of its pages (D7), which had none; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
 
 ---
 
@@ -381,7 +393,7 @@ All numbers on the disk are **little-endian**, like RAM.
 
 A disk whose block 0 doesn't start with this magic is **not formatted**: the kernel finds no file system on it.
 
-**Block bitmap** (block 1). One bit per block, 1 = in use. Block `b` is bit `b % 8` (least significant first) of byte `b / 8`. Blocks 0–17 are always marked in use. 16384 bits use the first 2048 bytes; the rest of the block is 0.
+**Block bitmap** (block 1). One bit per block, 1 = in use. Block `b` is bit `b % 8` (least significant first) of byte `b / 8`. Blocks 0–17 are always marked in use, and so are the swap area's blocks 15872–16383 (D1). 16384 bits use the first 2048 bytes; the rest of the block is 0.
 
 **Inode table** (blocks 2–17). 1024 inodes of **64 bytes**, 64 per block: inode `i` is at offset `(i % 64) × 64` in block `2 + i / 64`.
 
@@ -468,6 +480,79 @@ Running the call again is safe because the look phase changed nothing. The call 
   - The process gets the new address space, `pc` = the entry point, `sp` = `0x80000000`, every other register 0, and the new program's initial break.
   - It **keeps** its pid, its parent, its children, and its fd table: open files stay open, with their offsets (as in Unix). That is how a shell passes files to the program it runs.
 - `exec` does not return on success: the old program's code is gone. Blocks the file brought into the cache stay there.
+
+---
+
+# Part D — Swapping
+
+When RAM is full, the kernel moves pages it hasn't used lately to the disk and brings them back on demand (L9, "Virtual Memory": demand paging, page replacement, CLOCK). A program never notices, except that it runs slower.
+
+## D1. The swap area
+
+- The last **512 blocks** of the disk are the swap area: blocks `15872`–`16383` (`fs::kSwapStart`, `fs::kSwapBlocks`). Each block is one **slot** and holds one page: slot `s` is block `kSwapStart + s`, sectors `8 × (kSwapStart + s)` onwards.
+- `format` marks the swap blocks **in use** in the bitmap, so the file system never allocates them. (C1's bitmap after `format`: blocks `0`–`17` and `15872`–`16383` in use.)
+- The kernel keeps a **reference count** per slot: how many page table entries hold it (`fork` can make two). A slot is free when its count is 0. A new slot is always the lowest free one.
+
+## D2. Page table entries for swapped pages
+
+A `Pte` gets two more fields, both kernel-only (like `cow`):
+
+| Field | Meaning |
+|---|---|
+| `valid` (V) | The page is in RAM, in `frame`. When clear, **the MMU faults on every access**, whatever the permission bits, and sets no A/D bit (A2). |
+| `swap_slot` | The slot holding a copy of this page, or none. |
+
+- A **swapped-out** page has `valid` clear and a `swap_slot`. Its permission bits and `cow` stay as they were, ready for when it comes back. `frame` means nothing.
+- A **resident** page may *also* have a `swap_slot`: it was swapped in and the slot still holds the same bytes. Its **D bit** says whether that copy is out of date: D clear means the slot copy is exact, so the page can be dropped without writing it.
+- A page that was never swapped has no slot, so it must be written out before its frame can be reused, even if D is clear (the slot would otherwise not hold its bytes).
+- Dropping a page (`exit`, a kill, `exec`, a shrinking `sbrk`) drops its slot reference too. `fork` copies swapped-out entries like any other and adds one reference to each slot it copies. Only `valid` entries hold frames.
+
+## D3. Choosing a victim: CLOCK
+
+- **Candidates** are frames that hold exactly one valid user page (frame reference count 1) and that no queued or running disk request reads or writes (a `disk_read` buffer, a swap transfer). Block-cache frames and copy-on-write frames shared after `fork` are never evicted.
+- The kernel keeps one **hand**, a frame number, starting at 0. To choose a victim it looks at frame `hand` and moves the hand on by one (wrapping from 255 to 0), again and again:
+  - not a candidate: skip it;
+  - a candidate with **A set**: clear A (a "second chance") and skip it;
+  - a candidate with **A clear**: this is the victim. The hand is now just past it.
+- With at least one candidate this ends within two turns. With none, there is no victim.
+- This is `kernel::clock_choose` (`src/kernel/clock.hpp`), a function of the frames' states that the kernel then applies to the page tables.
+
+## D4. When the kernel evicts
+
+The kernel evicts when a user page needs a new frame (an untouched heap or stack page, a copy-on-write copy, a swapped-out page, D5) and the frame allocator has none free: in the page-fault handler, and when a system call touches that page through a user pointer (D7). The loader and the block cache don't evict: they fail as before when no frame is free.
+
+To evict the victim, page `v` of process `p` in frame `f`:
+
+1. Clear `valid` in `p`'s entry for `v`. From now on `p` faults on `v`.
+2. **Clean copy:** if the entry has a slot and D is clear, the slot already holds the page. Free `f` at once; the faulting instruction is retried at once (it will find `f` free).
+3. **Otherwise it must be written:** if the entry has no slot, or its slot is shared (count > 1, after `fork`), take a new slot (dropping the reference to the shared one). Queue a disk **write** of frame `f` to the slot. The faulting process **blocks** with its `pc` still on the faulting instruction. When the write completes, the kernel frees `f` and makes the faulting process runnable; it retries the instruction, faults again, and now finds a free frame (unless another process took it first: then it evicts again).
+4. No victim (no candidate), or no free slot: the faulting process is killed, as when no frame is free today.
+
+## D5. Bringing a page back
+
+A page fault on a page whose entry has `valid` clear and a slot:
+
+1. Get a frame, evicting if needed (D4), which may block first.
+2. Queue a disk **read** of the slot into the frame and block, `pc` on the faulting instruction.
+3. When it completes: set the entry's `frame`, set `valid`, clear A and D (the frame now equals the slot), keep the slot; make the process runnable. It retries the instruction, which now succeeds and sets A (and D for a store).
+
+- The disk queue is first come, first served, so if `v`'s eviction write is still queued when its owner faults on it again, the read comes after the write and gets the right bytes.
+- While the read is in flight, the frame belongs to no page table, so it can't be chosen as a victim.
+
+## D6. Observing swap traffic
+
+The kernel keeps no swap counters. Tests watch the disk instead: `Disk::completed()` lists every request the disk has finished, and a request whose first sector is in the swap area is one page written out (a write) or read back (a read). A clean drop (D4 step 2) shows up as an eviction with no write.
+
+## D7. System calls and swapped-out pages
+
+A system call's buffer, path or status pointer (B3 Rules) may lie on a page that is swapped out, or on an untouched page when RAM is full. The kernel handles it **as the process's own page fault would**:
+
+- A swapped-out page is brought back (D5), evicting first if no frame is free (D4). An untouched heap or stack page evicts if no frame is free, then is mapped.
+- If that needs the disk (a swap-in, or an eviction that writes), the process **blocks** and, once woken, **re-executes its `ECALL` from the start**, exactly like a call blocked on a missing block (C2). A buffer spanning several pages may take several rounds.
+- The re-run must repeat nothing, so every call checks **all** the pages it touches **before any side effect**: `write` prints nothing, `read` moves no offset, `wait` collects no child, `open` takes no fd, `disk_read` / `disk_write` queue nothing, until every page they touch is in RAM.
+- Where a page fault would kill the process (no victim, no free slot), the call returns `-EFAULT` instead. An address the process may not access is `-EFAULT` as before.
+
+This is why real kernels copy to and from user memory with functions that may sleep (Linux's `copy_to_user`).
 
 ---
 

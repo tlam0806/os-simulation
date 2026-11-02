@@ -3,6 +3,7 @@
 
 #include "kernel/abi.hpp"
 #include "kernel/kernel.hpp"
+#include "kernel/clock.hpp"
 #include "loader/elf.hpp"
 #include "util/bytes.hpp"
 #include "util/variant.hpp"
@@ -11,7 +12,10 @@ namespace kernel {
 
 std::variant<Continue, Switch> Kernel::sys_open() {
     uint32_t addr = cpu().reg(isa::reg::a0);
-    std::variant<uint32_t, Missing, int32_t> result = resolve_user_path(addr);
+    std::variant<uint32_t, Missing, int32_t, Blocked> result = resolve_user_path(addr);
+    if (std::holds_alternative<Blocked>(result)) {
+        return retry_call();
+    }
     if (auto error = std::get_if<int32_t>(&result)) {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(*error));
         return Continue{};
@@ -129,16 +133,19 @@ std::variant<Continue, Switch> Kernel::sys_read() {
         return wait_for(block_num);
     }
     for (uint32_t i = 0; i < bytes_to_read; ++i) {
-        auto physical_addr = try_access(buffer_addr + i, mmu::Access::store);
-        if (!physical_addr) {
+        auto access = try_access(buffer_addr + i, mmu::Access::store);
+        if (std::holds_alternative<Blocked>(access)) {
+            return retry_call();
+        }
+        if (std::holds_alternative<Fault>(access)) {
             cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
             return Continue{};
         }
     }
     for (uint32_t i = 0; i < bytes_to_read; ++i) {
-        auto physical_addr = try_access(buffer_addr + i, mmu::Access::store);
-        assert(physical_addr);
-        bool wrote = ram().write(*physical_addr, 1, (*block)[file->offset % fs::kBlockSize + i]);
+        auto access = try_access(buffer_addr + i, mmu::Access::store);
+        assert(std::holds_alternative<uint32_t>(access));
+        bool wrote = ram().write(std::get<uint32_t>(access), 1, (*block)[file->offset % fs::kBlockSize + i]);
         assert(wrote);
     }
     cpu().set_reg(isa::reg::a0, bytes_to_read);
@@ -148,6 +155,9 @@ std::variant<Continue, Switch> Kernel::sys_read() {
 
 std::variant<Continue, Switch> Kernel::sys_exec() {
     auto found = resolve_user_path(cpu().reg(isa::reg::a0));
+    if (std::holds_alternative<Blocked>(found)) {
+        return retry_call();
+    }
     if (auto error = std::get_if<int32_t>(&found)) {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(*error));
         return Continue{};
@@ -172,7 +182,7 @@ std::variant<Continue, Switch> Kernel::sys_exec() {
     mmu::PageTable fresh;
     const std::vector<uint8_t>& elf_bytes = std::get<std::vector<uint8_t>>(gathered_bytes);
     auto loaded = loader::load_elf(elf_bytes, ram(), frame_allocator(), fresh);
-    if (auto error = std::get_if<std::string>(&loaded)) {
+    if (std::holds_alternative<std::string>(loaded)) {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnoexec));
         return Continue{};
     }
@@ -253,6 +263,12 @@ Switch Kernel::block_on(uint32_t b) {
     process().blocked = BlockReason::IO;
     process().waiting_block = b;
     cpu().pc -= 4; // Rewind the program counter to retry the syscall later
+    return Switch{};
+}
+
+Switch Kernel::retry_call() {
+    assert(process().blocked == BlockReason::IO);
+    cpu().pc -= 4;
     return Switch{};
 }
 
@@ -344,12 +360,15 @@ std::variant<uint32_t, Kernel::Missing> Kernel::block_of(const fs::Inode& inode,
     return util::get32(*indirect_block, (k - fs::kNumDirect) * 4);
 }
 
-std::variant<uint32_t, Kernel::Missing, int32_t> Kernel::resolve_user_path(uint32_t addr) {
-    std::variant<std::string, int32_t> path = read_user_string(addr, kMaxPathBytes);
+std::variant<uint32_t, Kernel::Missing, int32_t, Blocked> Kernel::resolve_user_path(uint32_t addr) {
+    std::variant<std::string, int32_t, Blocked> path = read_user_string(addr, kMaxPathBytes);
+    if (std::holds_alternative<Blocked>(path)) {
+        return Blocked{};
+    }
     if (auto error = std::get_if<int32_t>(&path)) {
         return *error;
     }
-    return walk(std::get<std::string>(path));
+    return util::convert_variant<uint32_t, Missing, int32_t, Blocked>(walk(std::get<std::string>(path)));
 }
 
 std::variant<std::vector<uint8_t>, Kernel::Missing> Kernel::file_bytes(const fs::Inode& inode) {
@@ -373,9 +392,50 @@ std::variant<std::vector<uint8_t>, Kernel::Missing> Kernel::file_bytes(const fs:
 
 void Kernel::free_address_space(mmu::PageTable& table) {
     for (uint32_t vpn : table.mapped_pages()) {
-        uint32_t frame = table.lookup(vpn)->frame;
-        frame_allocator().free(frame);
+        auto pte = table.lookup(vpn);
+        assert(pte);
+        drop_entry(*pte);
     }
+}
+
+std::optional<Kernel::Victim> Kernel::choose_victim() {
+    std::vector<ClockFrame> candidates(mmu::kNumFrames);
+    std::unordered_map<uint32_t, FrameOwner> frame_owners; 
+    std::array<bool, mmu::kNumFrames> busy_frame{false}; // a request is only for 1 frame
+    // std::deque<PendingIO> pending_ios_;
+    for (PendingIO& pending : pending_ios_) {
+        disk::Request& request = pending.request;
+        uint32_t frame = request.ram_addr >> mmu::kPageShift;
+        busy_frame[frame] = true;
+    }
+    for (auto &[pid, process] : process_table_) {
+        for (uint32_t vpn : process.page_table.mapped_pages()) {
+            auto pte = process.page_table.lookup(vpn);
+            assert(pte);
+            if (pte->valid && frame_allocator().ref_count(pte->frame) == 1 && !busy_frame[pte->frame]) {
+                candidates[pte->frame] = ClockFrame{.candidate = true, .accessed = pte->accessed};
+                frame_owners[pte->frame] = FrameOwner{.pid = pid, .vpn = vpn};
+            }
+        }
+    }
+    auto clock_choice = clock_choose(candidates, clock_hand_);
+    if (!clock_choice) {
+        return std::nullopt;
+    }
+    clock_hand_ = clock_choice->hand;
+    for (auto frame : clock_choice->cleared) {
+        for (auto &[pid, process] : process_table_) {
+            for (uint32_t vpn : process.page_table.mapped_pages()) {
+                auto pte = process.page_table.lookup(vpn);
+                assert(pte);
+                if (pte->valid && pte->frame == frame) {
+                    pte->accessed = false;
+                    process.page_table.map(vpn, *pte);
+                }
+            }
+        }
+    }
+    return Victim{.frame = clock_choice->victim, .pid = frame_owners[clock_choice->victim].pid, .vpn = frame_owners[clock_choice->victim].vpn}; // TODO: fill in pid and vpn
 }
 
 }  // namespace kernel

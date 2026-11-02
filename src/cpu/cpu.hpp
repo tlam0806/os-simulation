@@ -50,12 +50,12 @@ public :
     // switches processes. nullptr turns translation off: addresses are then
     // physical and permissions are not checked (milestones 1-2).
     // The Cpu does not own the table; it must outlive its use here.
-    void set_page_table(const mmu::PageTable* table) noexcept;
+    void set_page_table(mmu::PageTable* table) noexcept;
 
 private : 
     std::array<uint32_t, 32> registers{};
     mem::Ram& ram;
-    const mmu::PageTable* page_table = nullptr;
+    mmu::PageTable* page_table = nullptr;   // not const: the MMU sets A and D bits
 
     std::variant<uint32_t, Trap> fetch() noexcept;
 

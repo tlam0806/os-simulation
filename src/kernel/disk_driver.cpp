@@ -39,18 +39,21 @@ std::variant<Continue, Switch> Kernel::disk_io(disk::Op op) {
     }
     mmu::Access access = (op == disk::Op::read ? mmu::Access::store : mmu::Access::load);
     auto physical_addr = try_access(buffer_addr, access);
-    if (!physical_addr) {
+    if (std::holds_alternative<Blocked>(physical_addr)) {
+        return retry_call();
+    }
+    if (std::holds_alternative<Fault>(physical_addr)) {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
         return Continue{};
     }
     cpu().set_reg(isa::reg::a0, 0);
-    enqueue(PendingIO{executing_pid, disk::Request{op, sector, count, *physical_addr}});
+    enqueue(PendingIO{executing_pid_, disk::Request{op, sector, count, std::get<uint32_t>(physical_addr)}});
     process().blocked = kernel::BlockReason::IO;
     return Switch{};
 }
 
 void Kernel::enqueue(PendingIO io) {
-    pending_ios_.push(io);
+    pending_ios_.push_back(io);
     if (!disk().busy()) {
         start_next_request();
     }
@@ -75,10 +78,31 @@ Continue Kernel::handle_disk_interrupt() {
         assert(process.blocked == kernel::BlockReason::IO);
         process.blocked = kernel::BlockReason::None;
         process.context.regs[isa::reg::a0] = 0; // return value for disk_read/disk_write
-    } else {
+    } else if (const auto* swap_out = std::get_if<SwapOut>(&next.owner)) {
+        // kernel::Process& process = process_table_.find(swap_out->pid)->second;
+        // assert(process.blocked == kernel::BlockReason::IO);
+        frame_allocator().free(swap_out->frame);
+        auto process_it = process_table_.find(swap_out->pid);
+        if (process_it != process_table_.end()) {
+            kernel::Process& process = process_it->second;
+            assert(process.blocked == kernel::BlockReason::IO);
+            process.blocked = kernel::BlockReason::None;
+        }
+    } else if (const auto* swap_in = std::get_if<SwapIn>(&next.owner)) {
+        kernel::Process& process = process_table_.find(swap_in->pid)->second;
+        assert(process.blocked == kernel::BlockReason::IO);
+        std::optional<mmu::Pte> pte = process.page_table.lookup(swap_in->vpn);
+        assert(pte);
+        assert(!pte->valid);
+        pte->valid = true;
+        pte->accessed = false;
+        pte->dirty = false;
+        pte->frame = swap_in->frame;
+        process.page_table.map(swap_in->vpn, *pte);
+        process.blocked = kernel::BlockReason::None;
+    }  else if (const auto* cache_fill = std::get_if<CacheFill>(&next.owner)) {
         // TODO (step 2): std::get<CacheFill>(next.owner).block is now in the cache.
-        CacheFill fill = std::get<CacheFill>(next.owner);
-        uint32_t b = fill.block;
+        uint32_t b = cache_fill->block;
         cached_blocks_[b].ready = true;
         for (auto& [pid, process] : process_table_) {
             if (process.waiting_block && process.waiting_block.value() == b) {
@@ -87,9 +111,11 @@ Continue Kernel::handle_disk_interrupt() {
                 process.waiting_block.reset();
             }
         }
+    } else {
+        assert(false && "Unknown PendingIO owner type");
     }
     assert(disk().busy() == false);
-    pending_ios_.pop();
+    pending_ios_.pop_front();
     if (pending_ios_.size()) {
         start_next_request();
     }

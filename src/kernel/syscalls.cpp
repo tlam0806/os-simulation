@@ -15,7 +15,7 @@ std::variant<Exited, Continue, Switch> Kernel::handle_syscall() {
         case abi::kSysExit :
             return sys_exit();
         case abi::kSysWrite :
-            return sys_write();
+            return util::convert_variant<Exited, Continue, Switch>(sys_write());
         case abi::kSysSbrk :
             return sys_sbrk();
         case abi::kSysGetpid :
@@ -52,7 +52,7 @@ Exited Kernel::sys_exit() {
     return Exited{a0_value};
 }
 
-Continue Kernel::sys_write() {
+std::variant<Continue, Switch> Kernel::sys_write() {
     int32_t fd = static_cast<int32_t>(cpu().reg(isa::reg::a0));
     uint32_t buffer_addr = cpu().reg(isa::reg::a1);
     uint32_t bytes_count = cpu().reg(isa::reg::a2);
@@ -61,12 +61,15 @@ Continue Kernel::sys_write() {
         return Continue{};
     }
     std::ostream& output = (fd == 1 ? out_ : err_);
-    std::optional<std::vector<uint8_t>> read_result = read_memory_on_ram(buffer_addr, bytes_count);
-    if (!read_result) {
+    auto read_result = read_memory_on_ram(buffer_addr, bytes_count);
+    if (std::holds_alternative<Blocked>(read_result)) {
+        return retry_call();
+    }
+    if (std::holds_alternative<Fault>(read_result)) {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
         return Continue{};
     }
-    for (auto byte : *read_result) {
+    for (auto byte : std::get<std::vector<uint8_t>>(read_result)) {
         output << byte;
     }
     cpu().set_reg(isa::reg::a0, bytes_count);
@@ -101,7 +104,7 @@ Continue Kernel::sys_sbrk() {
 }
 
 Continue Kernel::sys_getpid() {
-    cpu().set_reg(isa::reg::a0, executing_pid);
+    cpu().set_reg(isa::reg::a0, executing_pid_);
     return Continue{};
 }
 
@@ -112,7 +115,7 @@ Switch Kernel::sys_yield() {
 
 Continue Kernel::sys_fork() {
     Process copied = process();
-    copied.parent_pid = executing_pid;
+    copied.parent_pid = executing_pid_;
     copied.context = cpu().context();  // update context
     copied.context.regs[isa::reg::a0] = 0; 
     mmu::PageTable shared = share_table(page_table());
@@ -127,8 +130,8 @@ Continue Kernel::sys_fork() {
 
 std::variant<Continue, Switch> Kernel::sys_wait() {
     int32_t required_pid = static_cast<int32_t>(cpu().reg(isa::reg::a0));
-    std::vector<uint32_t> running = get_running_children_process(executing_pid, static_cast<uint32_t>(required_pid));
-    std::vector<uint32_t> ended = get_ended_children_process(executing_pid, static_cast<uint32_t>(required_pid));
+    std::vector<uint32_t> running = get_running_children_process(executing_pid_, static_cast<uint32_t>(required_pid));
+    std::vector<uint32_t> ended = get_ended_children_process(executing_pid_, static_cast<uint32_t>(required_pid));
     if (running.empty() && ended.empty()) {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEchild));
         return Continue{};
@@ -151,13 +154,16 @@ std::variant<Continue, Switch> Kernel::sys_wait() {
             cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
             return Continue{};
         }
-        auto physical_addr = try_access(addr, mmu::Access::store);
-        if (!physical_addr) {
+        auto access = try_access(addr, mmu::Access::store);
+        if (std::holds_alternative<Blocked>(access)) {
+            return retry_call();
+        }
+        if (std::holds_alternative<Fault>(access)) {
             cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
             return Continue{};
         }
         end.collected = true;
-        ram().write(*physical_addr, 4, end_status);
+        ram().write(std::get<uint32_t>(access), 4, end_status);
         cpu().set_reg(isa::reg::a0, pid);
         return Continue{};
     } 

@@ -8,7 +8,7 @@
 //     map a zero-filled R+W page and run the same instruction again.
 //   - Otherwise the process is killed, as before.
 // In write(): a buffer byte in an untouched heap or stack page gets its page
-// mapped, then is read normally. If no frame is free for it: -EFAULT.
+// mapped, then is read normally. If no frame is free for it, the kernel evicts a page first (D7).
 #include <cstdint>
 #include <sstream>
 #include <string>
@@ -196,10 +196,11 @@ TEST(lazy_write_past_the_break_is_still_efault) {
     CHECK_EQ(s.out.str(), std::string(""));
 }
 
-TEST(lazy_write_without_free_frame_is_efault) {
+TEST(lazy_write_without_free_frame_evicts) {
     // 15 processes x 17 frames = 255 of 256 frames: one is left. Process 1
     // touches one heap page (taking it), then writes from a second, untouched
-    // heap page: no frame for it, so -EFAULT (and nothing printed, no crash).
+    // heap page: no frame for it, so the kernel evicts a page to map it (D7)
+    // and write prints the new page's 4 zero bytes.
     System s;
     Asm one;
     one.sbrk(2 * 4096);
@@ -214,6 +215,6 @@ TEST(lazy_write_without_free_frame_is_efault) {
     for (int i = 0; i < 14; i++) s.spawn(idle);
     CHECK_EQ(s.m.frame_allocator().free_count(), 1);
     s.run();
-    CHECK_EQ(s.status(pid), -kEfault);
-    CHECK_EQ(s.out.str(), std::string(""));
+    CHECK_EQ(s.status(pid), 4);
+    CHECK(s.out.str() == std::string(4, '\0'));
 }

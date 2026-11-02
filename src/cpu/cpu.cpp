@@ -183,7 +183,7 @@ std::variant<uint32_t, Trap> Cpu::fetch() noexcept {
     }
 }
 
-void Cpu::set_page_table(const mmu::PageTable* ptr) noexcept {
+void Cpu::set_page_table(mmu::PageTable* ptr) noexcept {
     page_table = ptr;
 }
 
