@@ -116,7 +116,7 @@ TEST(open_block_caller_is_blocked_on_a_miss) {
     a.exit_with_a0();
     const uint32_t pid = s.spawn(a, str.bytes);
     CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(20)));
-    const kernel::Process* proc = s.k.process(pid);
+    const kernel::Thread* proc = s.k.thread(pid);
     CHECK(proc != nullptr);
     if (proc) CHECK(proc->blocked == kernel::BlockReason::IO);
     CHECK(s.m.disk().busy());

@@ -52,7 +52,7 @@ struct System {
     int32_t status(uint32_t pid) {
         const auto e = k.ending(pid);
         CHECK(e.has_value());
-        const auto* exited = e ? std::get_if<kernel::Exited>(&e->reason) : nullptr;
+        const auto* exited = e ? std::get_if<kernel::Exited>(&e->status) : nullptr;
         CHECK(exited != nullptr);
         return exited ? exited->exit_status : -12345;
     }
@@ -301,7 +301,7 @@ TEST(rawdisk_block_caller_is_blocked_during_io) {
     s.spawn(reader);
     s.spawn(looper);
     CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(3000)));
-    const kernel::Process* p = s.k.process(1);
+    const kernel::Thread* p = s.k.thread(1);
     CHECK(p != nullptr);
     if (p) CHECK(p->blocked == kernel::BlockReason::IO);
     CHECK(s.m.disk().busy());
@@ -403,7 +403,7 @@ TEST(rawdisk_block_step_limit_while_idle) {
     const uint32_t pid = s.spawn(a);
     CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(500)));
     CHECK_EQ(s.m.steps(), 500u);          // the clock advanced by exactly 500
-    const kernel::Process* p = s.k.process(pid);
+    const kernel::Thread* p = s.k.thread(pid);
     CHECK(p != nullptr);
     if (p) CHECK(p->blocked == kernel::BlockReason::IO);
     CHECK(s.m.disk().busy());

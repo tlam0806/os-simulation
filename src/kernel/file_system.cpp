@@ -186,14 +186,33 @@ std::variant<Continue, Switch> Kernel::sys_exec() {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnoexec));
         return Continue{};
     }
+    bool blocking_thread = false;
+    const std::vector<uint32_t> threads = process().threads;
+    uint32_t calling_tid = thread().tid;
+    for (uint32_t tid : threads) {
+        if (tid == calling_tid) continue; // the calling thread will be replaced by the new program
+        Thread& thread = thread_table_.at(tid);
+        if (thread.blocked == BlockReason::IO) {
+            blocking_thread = true;
+            thread.must_end = true;
+        } else {
+            end_thread(tid);
+        }
+    }
+    if (blocking_thread) {
+        free_address_space(fresh);
+        thread().blocked = BlockReason::Wait;
+        cpu().pc -= 4;
+        return Switch{};
+    }
     free_address_space(process().page_table);
     page_table() = std::move(fresh);
     const auto& program = std::get<loader::Program>(loaded);
     process().brk = process().initial_break = program.initial_break;
-    process().context = {};
-    process().context.pc = program.entry;
-    process().context.regs[isa::reg::sp] = static_cast<uint32_t>(loader::kStackTop);
-    cpu().set_context(process().context);
+    thread().context = {};
+    thread().context.pc = program.entry;
+    thread().context.regs[isa::reg::sp] = static_cast<uint32_t>(loader::kStackTop);
+    cpu().set_context(thread().context);
     return Continue{};
 }
 
@@ -260,14 +279,14 @@ std::variant<Continue, Switch> Kernel::wait_for(uint32_t b) {
 }
 
 Switch Kernel::block_on(uint32_t b) {
-    process().blocked = BlockReason::IO;
-    process().waiting_block = b;
+    thread().blocked = BlockReason::IO;
+    thread().waiting_block = b;
     cpu().pc -= 4; // Rewind the program counter to retry the syscall later
     return Switch{};
 }
 
 Switch Kernel::retry_call() {
-    assert(process().blocked == BlockReason::IO);
+    assert(thread().blocked == BlockReason::IO);
     cpu().pc -= 4;
     return Switch{};
 }

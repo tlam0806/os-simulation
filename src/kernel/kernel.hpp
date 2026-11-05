@@ -11,13 +11,6 @@
 #include "machine/machine.hpp"
 #include "fs/layout.hpp"
 namespace kernel {
-
-struct Exited {
-    int32_t exit_status = 0;    
-};
-struct Killed {
-    cpu::Trap trap;
-};
 struct StepLimit {
 };
 // A syscall finished: resume the same process right after the ecall.
@@ -27,18 +20,23 @@ struct Continue {
 struct Switch {
 };
 
+struct ThreadExited {
+    int32_t status = 0;
+};
+
 struct Blocked {
 };
 
 struct Fault {
 };
 
+
 // How a process ended.
 // using Ending = std::variant<Exited, Killed>;
 
 struct Ending {
     uint32_t parent_pid = 0;
-    std::variant<Exited, Killed> reason;
+    std::variant<Exited, Killed> status;
     bool collected = false;
 };
 
@@ -69,7 +67,7 @@ public :
     };
 
     struct SwapOut {
-        uint32_t pid; 
+        uint32_t tid; 
         uint32_t frame; 
     };
 
@@ -130,6 +128,9 @@ public :
     // The process with this pid, or nullptr if there is none.
     const Process* process(uint32_t pid) const;
 
+    // The thread with this tid, or nullptr if there is none.
+    const Thread* thread(uint32_t tid) const;
+
     // How many processes exist.
     size_t process_count() const;
 
@@ -158,9 +159,10 @@ public :
     std::optional<Ending> ending(uint32_t pid) const;
     
 private : 
-    uint32_t executing_pid_{};
+    uint32_t executing_tid_{};
     uint32_t next_pid_{};
     std::map<uint32_t, Process> process_table_{};
+    std::map<uint32_t, Thread> thread_table_{};
     std::map<uint32_t, Ending> ending_table_{};
     machine::Machine& machine_;
     std::ostream& out_;
@@ -174,11 +176,19 @@ private :
 
     std::variant<Continue, Switch> disk_io(disk::Op op);
     
-    std::variant<Exited, Killed, Continue, Switch> handle_trap(const cpu::Trap& trap);
+    std::variant<Exited, Killed, Continue, Switch, ThreadExited> handle_trap(const cpu::Trap& trap);
     
-    std::variant<Exited, Continue, Switch> handle_syscall();
+    std::variant<Exited, Continue, Switch, ThreadExited> handle_syscall();
 
     std::variant<std::vector<uint8_t>, Blocked, Fault> read_memory_on_ram(uint32_t addr, uint32_t bytes_count); 
+
+    ThreadExited sys_thread_exit();
+
+    std::variant<Continue, Switch> sys_thread_join();
+
+    Continue sys_gettid();
+
+    Continue sys_thread_create();
 
     std::variant<Continue, Switch> sys_exec();
 
@@ -226,23 +236,38 @@ private :
         return machine_.cpu();
     }
 
+    Thread& thread() {
+        return thread_table_.find(executing_tid_)->second;
+    }
+
+    const Thread& thread() const {
+        return thread_table_.find(executing_tid_)->second;
+    }
+
     Process& process() {  // context is not up to date when the process is running, needs to load again
-        return process_table_.find(executing_pid_)->second;
+        const Thread& current_thread = thread();
+        return process_table_.find(current_thread.pid)->second;
+    }
+
+    const Process& process() const {  // context is not up to date when the process is running, needs to load again
+        const Thread& current_thread = thread();
+        return process_table_.find(current_thread.pid)->second;
     }
 
     uint32_t current_break() {
-        Process& process = process_table_.find(executing_pid_)->second;
-        return process.brk;
+        return process().brk;
     }
 
     uint32_t initial_break() {
-        Process& process = process_table_.find(executing_pid_)->second;
-        return process.initial_break;
+        return process().initial_break;
     }
 
     mmu::PageTable& page_table() {
-        Process& process = process_table_.find(executing_pid_)->second;
-        return process.page_table;
+        return process().page_table;
+    }
+
+    const mmu::PageTable& page_table() const {
+        return process().page_table;
     }
 
     disk::Disk& disk() {
@@ -257,11 +282,6 @@ private :
     mmu::PageTable share_table(mmu::PageTable& other);
 
     void copy_frame(uint32_t old_frame, uint32_t new_frame);
-
-    const mmu::PageTable& page_table() const {
-        const Process& process = process_table_.find(executing_pid_)->second;
-        return process.page_table;
-    }
 
     mmu::FrameAllocator& frame_allocator() {
         return machine_.frame_allocator();
@@ -289,17 +309,21 @@ private :
 
     std::variant<uint32_t, Blocked, Fault> try_access(uint32_t addr, mmu::Access access);
 
-    Process* find_next_process(uint32_t last_exec);
+    Thread* find_next_thread(uint32_t last_exec);
 
-    void end_process(Process& process, std::variant<Exited, Killed> status);
+    void end_all_threads(Process& process, std::variant<Exited, Killed> status);
 
-    void save_process(Process& process);
+    void end_thread(uint32_t tid);
+
+    void end_process(uint32_t pid);
+
+    void save_thread(Thread& thread);
     
-    void load_process(Process& process);
+    void load_thread(Thread& thread);
 
     uint64_t run_helper(uint64_t max_step);
-    
-    uint32_t create_process(Process&& process);
+
+    uint32_t create_process(Process&& process, const cpu::Context& context);
 
     std::optional<mmu::Pte> handle_cow(mmu::Pte pte);
 

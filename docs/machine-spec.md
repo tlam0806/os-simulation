@@ -7,6 +7,8 @@ This document defines the simulated machine: the "hardware" that user programs r
 - **Part A** describes the hardware: CPU, memory, traps, timer, disk.
 - **Part B** describes the conventions between user programs and the kernel: address space layout, program loading, system calls.
 - **Part C** describes the file system: how files are laid out on the disk, and how the kernel reads them.
+- **Part D** describes swapping.
+- **Part E** describes threads.
 
 Instruction behavior follows the [RISC-V Unprivileged ISA Specification](https://github.com/riscv/riscv-isa-manual/releases). This document only records the choices RISC-V leaves open and the places where we simplify.
 
@@ -304,8 +306,12 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 | 12 | `close` | `a0` = fd | 0 | 7 |
 | 13 | `read` | `a0` = fd, `a1` = buffer address, `a2` = byte count | Bytes read | 7 |
 | 14 | `lseek` | `a0` = fd, `a1` = offset, `a2` = whence | The new offset | 7 |
+| 15 | `thread_create` | `a0` = entry address, `a1` = stack top, `a2` = argument | The new thread's id | E |
+| 16 | `thread_exit` | `a0` = status | Does not return | E |
+| 17 | `thread_join` | `a0` = thread id, `a1` = address to store the status (0: don't store) | The thread id | E |
+| 18 | `gettid` | | The caller's thread id | E |
 
-For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (11–14) and `exec` (7) are described in C3.
+For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (11–14) and `exec` (7) are described in C3, the thread calls (15–18) in Part E.
 
 `sbrk` returns `-EINVAL` if the new break would be below the initial break, and `-ENOMEM` if it would be above `0x7FF00000`. Otherwise it always succeeds: it maps nothing (see B1). Shrinking unmaps the heap pages the heap no longer covers; each of their frames is freed once no other mapping uses it (see `fork`).
 
@@ -323,7 +329,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (
 
 **`wait`** lets a parent collect a child that has ended:
 
-- It waits for a child of the caller that has ended: the one with pid `a0`, or any child if `a0` is −1. If such a child has already ended, it returns at once. Otherwise the caller is **blocked**: the scheduler skips it, so it runs no instructions, until a matching child ends (exits or is killed). That makes the caller runnable again. While blocked, its `pc` stays on the `ECALL`, so when it is next scheduled the `wait` runs again and collects the child. A blocked `wait` changed nothing, so running it again is safe. Deadlock is impossible: a process blocked in `wait` always has a live child, and following children down always reaches one that isn't blocked in `wait`. That one is either runnable or waiting for the disk, which always finishes.
+- It waits for a child of the caller that has ended: the one with pid `a0`, or any child if `a0` is −1. If such a child has already ended, it returns at once. Otherwise the caller is **blocked**: the scheduler skips it, so it runs no instructions, until a matching child ends (exits or is killed). That makes the caller runnable again. While blocked, its `pc` stays on the `ECALL`, so when it is next scheduled the `wait` runs again and collects the child. A blocked `wait` changed nothing, so running it again is safe.
 - It returns the child's pid. If `a1` isn't 0, it stores the child's status there as a 32-bit word: the exit status if the child called `exit`, or 128 + the trap cause if it was killed. Then the child is forgotten: a second `wait` can't collect it again.
 - If the caller has no child matching `a0` (ended or still running), it returns `-ECHILD` at once.
 - If `a1` isn't 0 and the status can't be stored there (the address isn't 4-byte aligned, like `SW`, or isn't writable by the caller), it returns `-EFAULT` and the child is **not** collected. Like `write`, the kernel maps an untouched heap or stack page first.
@@ -343,6 +349,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (
 | Name | Value | Meaning |
 |---|---|---|
 | `ENOENT` | 2 | No such file or directory |
+| `ESRCH` | 3 | No such thread |
 | `ENOEXEC` | 8 | Not an executable file |
 | `EBADF` | 9 | Bad file descriptor |
 | `ECHILD` | 10 | No child to wait for |
@@ -358,7 +365,7 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (
 **Rules:**
 
 - An unknown system call number returns `-ENOSYS`. The process is not killed.
-- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. A page that needs a frame when none is free, or that is swapped out, is handled as in D7. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed calls are a blocked `wait`, a file-system call or `exec` blocked on a missing block (C2), and a call that waited for one of its pages (D7), which had none; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
+- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. A page that needs a frame when none is free, or that is swapped out, is handled as in D7. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed calls are a blocked `wait` or `thread_join`, a file-system call or `exec` blocked on a missing block (C2), and a call that waited for one of its pages (D7), which had none; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
 
 ---
 
@@ -553,6 +560,59 @@ A system call's buffer, path or status pointer (B3 Rules) may lie on a page that
 - Where a page fault would kill the process (no victim, no free slot), the call returns `-EFAULT` instead. An address the process may not access is `-EFAULT` as before.
 
 This is why real kernels copy to and from user memory with functions that may sleep (Linux's `copy_to_user`).
+
+# Part E — Threads
+
+A process can have several **threads of control** (L5). These are **kernel threads**: the kernel knows about each one and schedules each one on its own, so one blocked thread doesn't stop the others.
+
+## E1. What threads share
+
+| Shared by all threads of a process | Private to each thread |
+|---|---|
+| Memory: code, data, heap, the break, the page table | Thread id |
+| Process id, parent, children | Registers and `pc` |
+| The fd table | Its stack (its own part of the shared memory) |
+
+- **Ids.** A process's first thread has a thread id equal to the pid. Pids and thread ids come from the same counter, so a new thread uses up a number. `getpid` returns the same value in every thread of a process; `gettid` returns the caller's own id.
+- **Scheduling.** The round robin of B3 runs over **threads**, in id order, each with its own quantum. Switching between two threads of one process changes registers and `pc` only, not the memory context, which is why a thread is "lightweight".
+- **No protection between threads.** Any thread can read and write any other's stack. Since the timer can stop a thread between any two instructions, two threads updating the same word can lose updates: a *race condition* (L6).
+
+## E2. System calls
+
+**`thread_create(entry, stack_top, arg)`** starts a new thread in the caller's process and returns its id.
+
+- It starts at `pc = entry` with `sp = stack_top`, `a0 = arg`, and every other register 0. The caller goes on after its `ECALL`.
+- The caller provides the stack, usually from `sbrk`. Nothing is copied and no frame is allocated, so `thread_create` always succeeds.
+- `entry` and `stack_top` are not checked. A bad one faults when it is used, like any other bad address in the program (E3).
+
+**`thread_exit(status)`** ends the calling thread only.
+
+**`thread_join(tid, status_addr)`** waits for a thread of the caller's process to end, and returns its id. Any thread may join any other, including the first.
+
+- If the thread is still running, the caller blocks, and re-runs its `ECALL` when a thread of its process ends, like `wait`.
+- If `status_addr` isn't 0, the thread's status is stored there as a 32-bit word. The thread is then forgotten: a second join returns `-ESRCH`.
+- `-ESRCH` if `tid` isn't a thread of this process that is running or waiting to be joined. `-EINVAL` if `tid` is the caller.
+- `-EFAULT` if the status can't be stored (as for `wait`), and the thread isn't collected.
+
+The only thing the kernel doesn't catch is threads that wait for each other forever, which is a **deadlock**: they stay blocked. Nothing in B3 is promised to end it.
+
+## E3. How threads and processes end
+
+- **The last thread.** When `thread_exit` ends the last thread of a process, the process ends with that status. A process's first thread may `thread_exit` and leave the others running.
+- **`exit`** in any thread ends **the whole process**, with that status.
+- **A fault** in any thread kills **the whole process** (status 128 + cause for `wait`, as before).
+- **Memory and fds** are released, and the process can be collected by `wait`, only when its last thread has ended. `thread_exit` of any other thread releases neither.
+- **A sibling waiting on the disk.** The disk may be writing into that thread's memory right now, so it can't be freed yet. Such a thread ends when its disk request completes, and until then the process isn't over. Threads that aren't waiting on the disk end at once.
+
+## E4. `fork`, `exec` and `wait` with threads
+
+- **`fork`** in a thread gives a child process with **one** thread: a copy of the caller. Other threads aren't copied. The child is a child of the process, so any of the parent's threads can `wait` for it.
+- **`exec`** that succeeds ends **every other thread** of the process, and the caller goes on as the only thread of the new program, under the same pid. If a sibling is waiting on the disk, the caller blocks and re-runs its `ECALL` once the sibling has ended. An `exec` that fails changes nothing: the siblings go on.
+- **`wait`** in any thread waits for a child of the process. When a child ends, every thread of the parent blocked in `wait` wakes and re-runs its call.
+
+## E5. Swapping with threads
+
+Threads fault independently on one page table, so two can fault on the same swapped-out page. A fault on a page whose swap-in is already queued or running **doesn't queue a second read**, and needs no frame: the thread blocks and re-runs its instruction (or `ECALL`) when the page arrives. The completion wakes every thread waiting for that page.
 
 ---
 

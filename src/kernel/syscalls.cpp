@@ -1,4 +1,5 @@
 // System calls (docs/machine-spec.md, B3) and the memory helpers they use.
+#include <algorithm>
 #include <cassert>
 
 #include "kernel/abi.hpp"
@@ -8,14 +9,14 @@
 
 namespace kernel {
 
-std::variant<Exited, Continue, Switch> Kernel::handle_syscall() {
+std::variant<Exited, Continue, Switch, ThreadExited> Kernel::handle_syscall() {
     cpu().pc += 4;   // every call that resumes continues after the ecall
     uint32_t a7_value = cpu().reg(isa::reg::a7);
     switch (a7_value) {
         case abi::kSysExit :
             return sys_exit();
         case abi::kSysWrite :
-            return util::convert_variant<Exited, Continue, Switch>(sys_write());
+            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_write());
         case abi::kSysSbrk :
             return sys_sbrk();
         case abi::kSysGetpid :
@@ -25,27 +26,98 @@ std::variant<Exited, Continue, Switch> Kernel::handle_syscall() {
         case abi::kSysFork : 
             return sys_fork();
         case abi::kSysWait :
-            return util::convert_variant<Exited, Continue, Switch>(sys_wait());
+            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_wait());
         case abi::kSysDiskRead :
-            return util::convert_variant<Exited, Continue, Switch>(sys_disk_read());
+            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_disk_read());
         case abi::kSysDiskWrite :
-            return util::convert_variant<Exited, Continue, Switch>(sys_disk_write());
+            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_disk_write());
         case abi::kSysOpen : 
-            return util::convert_variant<Exited, Continue, Switch>(sys_open());
+            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_open());
         case abi::kSysClose :
             return sys_close();
         case abi::kSysLseek :
-            return util::convert_variant<Exited, Continue, Switch>(sys_lseek());
+            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_lseek());
         case abi::kSysRead : 
-            return util::convert_variant<Exited, Continue, Switch>(sys_read());
+            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_read());
         case abi::kSysExec :
-            return util::convert_variant<Exited, Continue, Switch>(sys_exec());
+            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_exec());
+        case abi::kSysThreadCreate :
+            return sys_thread_create();
+        case abi::kSysGettid : 
+            return sys_gettid();
+        case abi::kSysThreadExit : 
+            return sys_thread_exit();
+        case abi::kSysThreadJoin : 
+            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_thread_join());
+        
         default :
             return sys_other();
     }
 }
 
+ThreadExited Kernel::sys_thread_exit() {
+    int32_t status = static_cast<int32_t>(cpu().reg(isa::reg::a0));
+    return ThreadExited{status};
+}
 
+std::variant<Continue, Switch> Kernel::sys_thread_join() {
+    uint32_t tid = cpu().reg(isa::reg::a0);
+    uint32_t status_addr = cpu().reg(isa::reg::a1);
+    if (tid == executing_tid_) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
+        return Continue{};
+    }
+    Process& process = this->process();
+    auto it = process.ended_threads.find(tid);
+    if (it != process.ended_threads.end()) {
+        if (status_addr != 0) {
+            if (status_addr % 4) {
+                cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
+                return Continue{};
+            }
+            auto access = try_access(status_addr, mmu::Access::store);
+            if (std::holds_alternative<Blocked>(access)) {
+                return retry_call();
+            }
+            if (std::holds_alternative<Fault>(access)) {
+                cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
+                return Continue{};
+            }
+            ram().write(std::get<uint32_t>(access), 4, static_cast<uint32_t>(it->second));
+        }
+        process.ended_threads.erase(it); // last: a re-run or a retry must still find it
+        cpu().set_reg(isa::reg::a0, tid);
+        return Continue{};
+    }
+    if (std::find(process.threads.begin(), process.threads.end(), tid) != process.threads.end()) {
+        thread().blocked = BlockReason::Wait;
+        cpu().pc -= 4;
+        return Switch{};
+    }
+    cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEsrch));
+    return Continue{};
+}
+
+Continue Kernel::sys_gettid() {
+    cpu().set_reg(isa::reg::a0, executing_tid_);
+    return Continue{};
+}
+
+Continue Kernel::sys_thread_create() {
+    uint32_t pc = cpu().reg(isa::reg::a0);
+    uint32_t sp = cpu().reg(isa::reg::a1);
+    uint32_t a0 = cpu().reg(isa::reg::a2);
+    uint32_t tid = ++next_pid_;
+    cpu::Context context;
+    context.pc = pc;
+    context.regs[isa::reg::sp] = sp;
+    context.regs[isa::reg::a0] = a0;
+    Thread thread{.tid = tid, .pid = process().pid, .context = context};
+    process().threads.push_back(tid);
+    cpu().set_reg(isa::reg::a0, tid);
+    thread_table_.emplace(tid, std::move(thread));
+    return Continue{};
+}
 
 Exited Kernel::sys_exit() {
     int32_t a0_value = static_cast<int32_t>(cpu().reg(isa::reg::a0));
@@ -104,7 +176,7 @@ Continue Kernel::sys_sbrk() {
 }
 
 Continue Kernel::sys_getpid() {
-    cpu().set_reg(isa::reg::a0, executing_pid_);
+    cpu().set_reg(isa::reg::a0, process().pid);
     return Continue{};
 }
 
@@ -115,23 +187,24 @@ Switch Kernel::sys_yield() {
 
 Continue Kernel::sys_fork() {
     Process copied = process();
-    copied.parent_pid = executing_pid_;
-    copied.context = cpu().context();  // update context
-    copied.context.regs[isa::reg::a0] = 0; 
+    copied.threads.clear();
+    copied.parent_pid = process().pid;
+    cpu::Context context = cpu().context();
+    context.regs[isa::reg::a0] = 0; 
     mmu::PageTable shared = share_table(page_table());
     copied.page_table = shared;
     for (auto& fd : copied.fd_table) {
         if (fd) share_open_file(*fd);
     }
-    uint32_t child_pid = create_process(std::move(copied));
+    uint32_t child_pid = create_process(std::move(copied), context);
     cpu().set_reg(isa::reg::a0, child_pid);
     return Continue{};
 }
 
 std::variant<Continue, Switch> Kernel::sys_wait() {
     int32_t required_pid = static_cast<int32_t>(cpu().reg(isa::reg::a0));
-    std::vector<uint32_t> running = get_running_children_process(executing_pid_, static_cast<uint32_t>(required_pid));
-    std::vector<uint32_t> ended = get_ended_children_process(executing_pid_, static_cast<uint32_t>(required_pid));
+    std::vector<uint32_t> running = get_running_children_process(process().pid, static_cast<uint32_t>(required_pid));
+    std::vector<uint32_t> ended = get_ended_children_process(process().pid, static_cast<uint32_t>(required_pid));
     if (running.empty() && ended.empty()) {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEchild));
         return Continue{};
@@ -141,9 +214,9 @@ std::variant<Continue, Switch> Kernel::sys_wait() {
         auto it = ending_table_.find(pid);
         assert(it != ending_table_.end());
         Ending& end = it->second;
-        int32_t end_status = std::holds_alternative<Exited>(end.reason) 
-            ? std::get<Exited>(end.reason).exit_status 
-            : static_cast<int32_t>(std::get<Killed>(end.reason).trap.cause) + 128;
+        int32_t end_status = std::holds_alternative<Exited>(end.status) 
+            ? std::get<Exited>(end.status).exit_status 
+            : static_cast<int32_t>(std::get<Killed>(end.status).trap.cause) + 128;
         uint32_t addr = cpu().reg(isa::reg::a1);
         if (addr == 0) {
             end.collected = true;
@@ -167,7 +240,7 @@ std::variant<Continue, Switch> Kernel::sys_wait() {
         cpu().set_reg(isa::reg::a0, pid);
         return Continue{};
     } 
-    process().blocked = kernel::BlockReason::Wait;
+    thread().blocked = kernel::BlockReason::Wait;
     cpu().pc -= 4;
     return Switch{};
 }

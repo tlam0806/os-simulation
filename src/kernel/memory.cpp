@@ -12,7 +12,15 @@ std::variant<Killed, Continue, Switch> Kernel::handle_page_fault(const cpu::Trap
     uint32_t addr = trap.tval;
     uint32_t vpn = mmu::get_vpn(addr);
     auto found = page_table().lookup(vpn);
-
+    for (const PendingIO& io : pending_ios_) {
+        if (const SwapIn* swap_in = std::get_if<SwapIn>(&io.owner)) {
+            if (swap_in->vpn == vpn) {
+                thread().waiting_page = vpn;
+                thread().blocked = kernel::BlockReason::IO;
+                return Switch{};
+            }
+        }
+    }
     if (fault_needs_frame(found, trap) && frame_allocator().free_count() == 0) {
         auto evict_result = evict();
         if (evict_result == EvictResult::Failed) {
@@ -143,11 +151,12 @@ void Kernel::swap_in(uint32_t vpn, const mmu::Pte& pte) {
     uint32_t sector = (*pte.swap_slot + fs::kSwapStart) * fs::kSectorsPerBlock;
     enqueue(
         PendingIO{
-            SwapIn{executing_pid_, vpn, *new_frame},
+            SwapIn{process().pid, vpn, *new_frame},
             disk::Request{disk::Op::read, sector, fs::kSectorsPerBlock, *new_frame << mmu::kPageShift}
         }
     );
-    process().blocked = BlockReason::IO;
+    thread().waiting_page = vpn;
+    thread().blocked = BlockReason::IO;
 }
 
 bool Kernel::map_page(uint32_t vpn) {
@@ -286,13 +295,13 @@ Kernel::EvictResult Kernel::evict() {
         assert(sector < fs::kNumBlocks * fs::kSectorsPerBlock);
         enqueue(
             PendingIO{
-                SwapOut{executing_pid_, frame}, 
+                SwapOut{executing_tid_, frame}, 
                 disk::Request{disk::Op::write, sector, fs::kSectorsPerBlock, frame << mmu::kPageShift}
             }
         );
         pte->valid = false;
         owner.page_table.map(vpn, *pte);
-        process().blocked = BlockReason::IO;
+        thread().blocked = BlockReason::IO;
         return EvictResult::Blocked;
     }
 }

@@ -55,7 +55,7 @@ struct System {
     int32_t status(uint32_t pid) {
         const auto e = k.ending(pid);
         CHECK(e.has_value());
-        const auto* exited = e ? std::get_if<kernel::Exited>(&e->reason) : nullptr;
+        const auto* exited = e ? std::get_if<kernel::Exited>(&e->status) : nullptr;
         CHECK(exited != nullptr);
         return exited ? exited->exit_status : -12345;
     }
@@ -466,8 +466,8 @@ TEST(wait_sleeps_parent_is_blocked_while_child_runs) {
     a.emit({JAL, zero, 0, 0, 0});         // child loops forever
     s.spawn(a);
     CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(5000)));
-    const kernel::Process* parent = s.k.process(1);
-    const kernel::Process* child = s.k.process(2);
+    const kernel::Thread* parent = s.k.thread(1);
+    const kernel::Thread* child = s.k.thread(2);
     CHECK(parent != nullptr && child != nullptr);
     if (!parent || !child) return;
     CHECK(parent->blocked == kernel::BlockReason::Wait);
@@ -495,7 +495,7 @@ TEST(wait_sleeps_child_exit_makes_parent_runnable) {
     a.exit_with(0);
     s.spawn(a);
     CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(20000)));
-    const kernel::Process* parent = s.k.process(1);
+    const kernel::Thread* parent = s.k.thread(1);
     CHECK(parent != nullptr);
     if (!parent) return;
     CHECK(parent->blocked == kernel::BlockReason::None);
@@ -519,7 +519,7 @@ TEST(wait_sleeps_other_child_does_not_wake) {
     s.spawn(a);
     CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(5000)));
     CHECK(s.k.ending(2).has_value());
-    const kernel::Process* parent = s.k.process(1);
+    const kernel::Thread* parent = s.k.thread(1);
     CHECK(parent != nullptr);
     if (parent) CHECK(parent->blocked == kernel::BlockReason::Wait);
 }
@@ -540,7 +540,7 @@ TEST(wait_sleeps_grandchild_end_does_not_wake) {
     s.spawn(a);
     CHECK(std::holds_alternative<kernel::StepLimit>(s.k.run_all(5000)));
     CHECK(s.k.ending(3).has_value());
-    const kernel::Process* parent = s.k.process(1);
+    const kernel::Thread* parent = s.k.thread(1);
     CHECK(parent != nullptr);
     if (parent) CHECK(parent->blocked == kernel::BlockReason::Wait);
 }

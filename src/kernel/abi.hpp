@@ -21,10 +21,15 @@ inline constexpr uint32_t kSysOpen = 11;
 inline constexpr uint32_t kSysClose = 12;
 inline constexpr uint32_t kSysRead = 13;
 inline constexpr uint32_t kSysLseek = 14;
+inline constexpr uint32_t kSysThreadCreate = 15;
+inline constexpr uint32_t kSysThreadExit = 16;
+inline constexpr uint32_t kSysThreadJoin = 17;
+inline constexpr uint32_t kSysGettid = 18;
 
 // Error codes, using Linux's values. A failed call returns -code in a0.
 // (Not EBADF etc.: those names are macros in <errno.h>.)
 inline constexpr int32_t kEnoent = 2;   // no such file or directory
+inline constexpr int32_t kEsrch = 3;    // no such thread
 inline constexpr int32_t kEnoexec = 8;  // not an executable file
 inline constexpr int32_t kEbadf = 9;    // bad file descriptor
 inline constexpr int32_t kEchild = 10;  // no child to wait for

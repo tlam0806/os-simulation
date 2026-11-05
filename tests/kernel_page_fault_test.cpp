@@ -46,14 +46,14 @@ struct System {
 
     int32_t status(uint32_t pid) {
         const auto e = k.ending(pid);
-        const auto* exited = e ? std::get_if<kernel::Exited>(&e->reason) : nullptr;
+        const auto* exited = e ? std::get_if<kernel::Exited>(&e->status) : nullptr;
         CHECK(exited != nullptr);
         return exited ? exited->exit_status : -12345;
     }
 
     cpu::Trap killed_by(uint32_t pid) {
         const auto e = k.ending(pid);
-        const auto* killed = e ? std::get_if<kernel::Killed>(&e->reason) : nullptr;
+        const auto* killed = e ? std::get_if<kernel::Killed>(&e->status) : nullptr;
         CHECK(killed != nullptr);
         return killed ? killed->trap : cpu::Trap{};
     }

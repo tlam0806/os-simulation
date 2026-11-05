@@ -67,7 +67,7 @@ TEST(spawn_returns_pids_in_order) {
 TEST(spawn_sets_up_context) {
     System s;
     const uint32_t pid = s.spawn_ok(make_elf(0x10008, {{0x10000, code({{ECALL}, {ECALL}, {ECALL}})}}));
-    const kernel::Process* p = s.k.process(pid);
+    const kernel::Thread* p = s.k.thread(pid);
     CHECK(p != nullptr);
     if (!p) return;
     CHECK_EQ(p->pid, pid);

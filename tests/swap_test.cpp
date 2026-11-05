@@ -292,7 +292,7 @@ TEST(swap_slots_full_kills_the_process) {
     const uint32_t pid = s.spawn(a);
     CHECK(std::holds_alternative<kernel::AllDone>(s.k.run_all(kForever)));
     const auto e = s.k.ending(pid);
-    CHECK(e.has_value() && std::holds_alternative<kernel::Killed>(e->reason));
+    CHECK(e.has_value() && std::holds_alternative<kernel::Killed>(e->status));
     // Its slots are free again: a normal program runs.
     CHECK_EQ(run_one(s, heap_program(300, 1)), 0);
 }

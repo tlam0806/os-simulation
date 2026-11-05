@@ -9,17 +9,20 @@
 
 namespace kernel {
 
-uint32_t Kernel::create_process(Process&& process) {
+uint32_t Kernel::create_process(Process&& process, const cpu::Context& context) {
     uint32_t pid = ++next_pid_;
     process.pid = pid;
-    process_table_.emplace(process.pid, std::move(process));
+    Thread thread{.tid = pid, .pid = pid, .context = context};
+    process.threads.push_back(thread.tid);
+    thread_table_.emplace(pid, std::move(thread));
+    process_table_.emplace(pid, std::move(process));
     return pid;
 }
 
-std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Trap& trap) {
+std::variant<Exited, Killed, Continue, Switch, ThreadExited> Kernel::handle_trap(const cpu::Trap& trap) {
     switch (trap.cause) {
         case cpu::Cause::ecall :
-            return util::convert_variant<Exited, Killed, Continue, Switch>(handle_syscall());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(handle_syscall());
         case cpu::Cause::disk_interrupt :
             return handle_disk_interrupt();        
         case cpu::Cause::timer_interrupt :
@@ -27,7 +30,7 @@ std::variant<Exited, Killed, Continue, Switch> Kernel::handle_trap(const cpu::Tr
         case cpu::Cause::load_page_fault :
         case cpu::Cause::store_page_fault : 
         case cpu::Cause::instruction_page_fault :
-            return util::convert_variant<Exited, Killed, Continue, Switch>(handle_page_fault(trap));
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(handle_page_fault(trap));
         default :
             return Killed{trap};   // any fault ends the process
     }
@@ -66,9 +69,10 @@ std::variant<uint32_t, std::string> Kernel::spawn(std::span<const uint8_t> elf) 
     }
     loader::Program& program = std::get<loader::Program>(load_result);
     process.brk = process.initial_break = program.initial_break;
-    process.context.pc = program.entry;
-    process.context.regs[isa::reg::sp] = static_cast<uint32_t>(loader::kStackTop);
-    return create_process(std::move(process));
+    cpu::Context context{};
+    context.pc = program.entry;
+    context.regs[isa::reg::sp] = static_cast<uint32_t>(loader::kStackTop);
+    return create_process(std::move(process), context);
 }
 
 const Process* Kernel::process(uint32_t pid) const {
@@ -79,29 +83,83 @@ const Process* Kernel::process(uint32_t pid) const {
     return std::addressof(it->second);
 }
 
+const Thread* Kernel::thread(uint32_t tid) const {
+    auto it = thread_table_.find(tid);
+    if (it == thread_table_.end()) {
+        return nullptr;
+    }
+    return std::addressof(it->second);
+}
+
 size_t Kernel::process_count() const {
     return process_table_.size();
 }
 
-Process* Kernel::find_next_process(uint32_t last_exec) {
+Thread* Kernel::find_next_thread(uint32_t last_exec) {
     assert(process_count());
     uint32_t cur_pid = last_exec;
-    uint32_t process_count = process_table_.size();
-    while (process_count--) {
-        auto it = process_table_.upper_bound(cur_pid);
-        if (it == process_table_.end()) {
-            it = process_table_.begin();
+    uint32_t thread_count = thread_table_.size();
+    while (thread_count--) {
+        auto it = thread_table_.upper_bound(cur_pid);
+        if (it == thread_table_.end()) {
+            it = thread_table_.begin();
         }
         if (it->second.blocked == BlockReason::None) {
             return std::addressof(it->second);
         }
         cur_pid = it->first;
     } 
-    // no process is runnable
+    // no thread is runnable
     return nullptr;
 }
 
-void Kernel::end_process(Process& process, std::variant<Exited, Killed> status) {
+void Kernel::end_all_threads(Process& process, std::variant<Exited, Killed> status) {
+    process.status = status;
+    const std::vector<uint32_t> threads = process.threads;
+    for (uint32_t tid : threads) {
+        assert(thread_table_.find(tid) != thread_table_.end());
+        auto thread_it = thread_table_.find(tid);
+        assert(thread_it != thread_table_.end());
+        Thread& thread = thread_it->second;
+        if (thread.blocked == BlockReason::IO) {
+            thread.must_end = true;
+        } else {
+            end_thread(tid);
+        }
+    }
+}
+
+void Kernel::end_thread(uint32_t tid) {
+    assert(thread_table_.find(tid) != thread_table_.end());
+    auto thread_it = thread_table_.find(tid);
+    assert(thread_it != thread_table_.end());
+    Thread& thread = thread_it->second;
+    Process& process = process_table_.find(thread.pid)->second;
+    uint32_t pid = process.pid;
+    std::erase(process.threads, tid);
+    thread_table_.erase(tid);
+    if (process.threads.empty()) {
+        end_process(pid);
+    } else {
+        // There are still threads in the process, so we don't end it yet
+        for (const uint32_t tid : process.threads) {
+            auto thread_it = thread_table_.find(tid);
+            assert(thread_it != thread_table_.end());
+            Thread& thread = thread_it->second;
+            if (thread.blocked == BlockReason::Wait) {
+                thread.blocked = BlockReason::None;
+            }
+        }
+    }
+}
+
+void Kernel::end_process(uint32_t pid) {
+    auto it = process_table_.find(pid);
+    assert(it != process_table_.end());
+    Process& process = it->second;
+    for (uint32_t tid : process.threads) {
+        thread_table_.erase(tid);
+    }
     for (auto& [pid, other] : process_table_) {
         if (other.parent_pid == process.pid) {
             other.parent_pid = init;
@@ -112,7 +170,7 @@ void Kernel::end_process(Process& process, std::variant<Exited, Killed> status) 
             ending.parent_pid = init;
         }
     }
-    Ending ending{process.parent_pid, status, false};
+    Ending ending{process.parent_pid, *process.status, false};
     ending_table_.emplace(process.pid, ending);
     free_address_space(process.page_table);
     for (auto& fd : process.fd_table) {
@@ -124,8 +182,15 @@ void Kernel::end_process(Process& process, std::variant<Exited, Killed> status) 
     // the parent is no longer blocked
     auto parent_it = process_table_.find(process.parent_pid);
     if (parent_it != process_table_.end()) {
-        if (parent_it->second.blocked == kernel::BlockReason::Wait) {
-            parent_it->second.blocked = kernel::BlockReason::None;
+        const Process& parent = parent_it->second;
+        for (const uint32_t tid : parent.threads) {
+            auto thread_it = thread_table_.find(tid);
+            assert(thread_it != thread_table_.end());
+            Thread& thread = thread_it->second;
+            if (thread.blocked == BlockReason::Wait) {
+                thread.blocked = BlockReason::None;
+                thread.waiting_block.reset();
+            }
         }
     }
     process_table_.erase(process.pid); // should be last, because process is deleted
@@ -142,20 +207,20 @@ std::optional<Ending> Kernel::ending(uint32_t pid) const {
 
 // ---- scheduling ----
 
-void Kernel::save_process(Process& process) {
-    process.context = cpu().context();
+void Kernel::save_thread(Thread& thread) {
+    thread.context = cpu().context();
 }
 
-void Kernel::load_process(Process& process) {
-    executing_pid_ = process.pid;
-    cpu().set_context(process.context);
-    cpu().set_page_table(&process.page_table);
+void Kernel::load_thread(Thread& thread) {
+    executing_tid_ = thread.tid;
+    cpu().set_context(thread.context);
+    cpu().set_page_table(&process().page_table);
 }
 
-// Runs the next process for one turn; returns how many of max_steps are left.
+// Runs the next thread for one turn; returns how many of max_steps are left.
 uint64_t Kernel::run_helper(uint64_t max_steps) {
-    Process* maybe_process = find_next_process(executing_pid_);
-    if (!maybe_process) { // every process is blocked: wait for an interrupt
+    Thread* maybe_thread = find_next_thread(executing_tid_);
+    if (!maybe_thread) { // every thread is blocked: wait for an interrupt
         uint64_t old_steps = machine_.steps();
         machine_.set_timer(machine_.steps() + max_steps);
         auto trap = machine_.wait_for_interrupt();
@@ -170,10 +235,14 @@ uint64_t Kernel::run_helper(uint64_t max_steps) {
         }
         return max_steps;
     }
-    Process& process = *maybe_process;
-    load_process(process);
+    Thread& thread = *maybe_thread;
+    if (thread.must_end) {
+        end_thread(thread.tid);
+        return max_steps;
+    }
+    load_thread(thread);
     machine_.set_timer(machine_.steps() + kQuantum);
-    // repeatedly run the process
+    // repeatedly run the thread
     while (true) {
         // update taken steps to remaining steps
         uint64_t old_steps = machine_.steps();
@@ -184,18 +253,29 @@ uint64_t Kernel::run_helper(uint64_t max_steps) {
         // check the trap
         if (run_result) {
             const cpu::Trap& trap = *run_result;
-            std::variant<Exited, Killed, Continue, Switch> handle_result = handle_trap(trap);
+            std::variant<Exited, Killed, Continue, Switch, ThreadExited> handle_result = handle_trap(trap);
             if (std::holds_alternative<Switch>(handle_result)) {
-                save_process(process);
+                save_thread(thread);
                 return max_steps;
             } else if (std::holds_alternative<Continue>(handle_result)) {
                 continue;
-            } else { // exited or killed
-                end_process(process, util::convert_variant<Exited, Killed>(handle_result));
+            } else if (auto* exited = std::get_if<Exited>(&handle_result)) {
+                // end_process(process(), *exited);
+                end_all_threads(process(), *exited);
                 return max_steps;
+            } else if (auto* thread_exited = std::get_if<ThreadExited>(&handle_result)) {
+                uint32_t tid = thread.tid;
+                process().status = Exited{thread_exited->status};
+                process().ended_threads.emplace(tid, thread_exited->status);
+                end_thread(tid);
+                return max_steps;
+            } else { // killed
+                auto* killed = std::get_if<Killed>(&handle_result);
+                end_all_threads(process(), *killed);
+                return max_steps;   
             }
         } else { // should be step limit
-            save_process(process);
+            save_thread(thread);
             return max_steps;
         }
     }

@@ -47,8 +47,8 @@ std::variant<Continue, Switch> Kernel::disk_io(disk::Op op) {
         return Continue{};
     }
     cpu().set_reg(isa::reg::a0, 0);
-    enqueue(PendingIO{executing_pid_, disk::Request{op, sector, count, std::get<uint32_t>(physical_addr)}});
-    process().blocked = kernel::BlockReason::IO;
+    enqueue(PendingIO{executing_tid_, disk::Request{op, sector, count, std::get<uint32_t>(physical_addr)}});
+    thread().blocked = kernel::BlockReason::IO;
     return Switch{};
 }
 
@@ -68,29 +68,23 @@ void Kernel::start_next_request() {
 
 Continue Kernel::handle_disk_interrupt() {
     assert(pending_ios_.size());
-    if (pending_ios_.empty()) {
-        return Continue{};
-    }
     const PendingIO& next = pending_ios_.front();
     machine_.acknowledge_disk_interrupt();
-    if (const uint32_t* pid = std::get_if<uint32_t>(&next.owner)) {
-        kernel::Process& process = process_table_.find(*pid)->second;
-        assert(process.blocked == kernel::BlockReason::IO);
-        process.blocked = kernel::BlockReason::None;
-        process.context.regs[isa::reg::a0] = 0; // return value for disk_read/disk_write
+    if (const uint32_t* tid = std::get_if<uint32_t>(&next.owner)) {
+        Thread& thread = thread_table_.find(*tid)->second;
+        assert(thread.blocked == kernel::BlockReason::IO);
+        thread.blocked = kernel::BlockReason::None;
+        thread.context.regs[isa::reg::a0] = 0; // return value for disk_read/disk_write
     } else if (const auto* swap_out = std::get_if<SwapOut>(&next.owner)) {
-        // kernel::Process& process = process_table_.find(swap_out->pid)->second;
-        // assert(process.blocked == kernel::BlockReason::IO);
         frame_allocator().free(swap_out->frame);
-        auto process_it = process_table_.find(swap_out->pid);
-        if (process_it != process_table_.end()) {
-            kernel::Process& process = process_it->second;
-            assert(process.blocked == kernel::BlockReason::IO);
-            process.blocked = kernel::BlockReason::None;
+        auto thread_it = thread_table_.find(swap_out->tid);
+        if (thread_it != thread_table_.end()) {
+            Thread& thread = thread_it->second;
+            assert(thread.blocked == kernel::BlockReason::IO);
+            thread.blocked = kernel::BlockReason::None;
         }
     } else if (const auto* swap_in = std::get_if<SwapIn>(&next.owner)) {
-        kernel::Process& process = process_table_.find(swap_in->pid)->second;
-        assert(process.blocked == kernel::BlockReason::IO);
+        Process& process = process_table_.find(swap_in->pid)->second;
         std::optional<mmu::Pte> pte = process.page_table.lookup(swap_in->vpn);
         assert(pte);
         assert(!pte->valid);
@@ -99,16 +93,23 @@ Continue Kernel::handle_disk_interrupt() {
         pte->dirty = false;
         pte->frame = swap_in->frame;
         process.page_table.map(swap_in->vpn, *pte);
-        process.blocked = kernel::BlockReason::None;
+        for (uint32_t tid : process.threads) {
+            Thread& thread = thread_table_.find(tid)->second;
+            if (thread.waiting_page && thread.waiting_page.value() == swap_in->vpn) {
+                assert(thread.blocked == kernel::BlockReason::IO);
+                thread.blocked = kernel::BlockReason::None;
+                thread.waiting_page.reset();
+            }
+        }
     }  else if (const auto* cache_fill = std::get_if<CacheFill>(&next.owner)) {
         // TODO (step 2): std::get<CacheFill>(next.owner).block is now in the cache.
         uint32_t b = cache_fill->block;
         cached_blocks_[b].ready = true;
-        for (auto& [pid, process] : process_table_) {
-            if (process.waiting_block && process.waiting_block.value() == b) {
-                assert(process.blocked == kernel::BlockReason::IO);
-                process.blocked = kernel::BlockReason::None;
-                process.waiting_block.reset();
+        for (auto& [tid, thread] : thread_table_) {
+            if (thread.waiting_block && thread.waiting_block.value() == b) {
+                assert(thread.blocked == kernel::BlockReason::IO);
+                thread.blocked = kernel::BlockReason::None;
+                thread.waiting_block.reset();
             }
         }
     } else {
