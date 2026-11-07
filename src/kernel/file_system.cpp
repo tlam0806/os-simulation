@@ -35,7 +35,7 @@ std::variant<Continue, Switch> Kernel::sys_open() {
         return Continue{};
     }
 
-    file_table_[*open_file] = OpenFile{.inode = inode_index, .offset = 0, .refs = 1};
+    file_table_[*open_file] = OpenFile{.kind = InodeFile{.inode = inode_index, .offset = 0}, .refs = 1};
     process().fd_table[*fd] = *open_file;
     cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(*fd));
     return Continue{};
@@ -66,6 +66,12 @@ std::variant<Continue, Switch> Kernel::sys_lseek() {
         return Continue{};
     }
     OpenFile& open_file = *file;
+    if (std::holds_alternative<PipeFile>(open_file.kind)) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEspipe));
+        return Continue{};
+    }
+    assert(std::holds_alternative<InodeFile>(open_file.kind));
+    InodeFile& inode_file = std::get<InodeFile>(open_file.kind);
 
     int64_t new_offset;
     switch (whence) {
@@ -73,10 +79,10 @@ std::variant<Continue, Switch> Kernel::sys_lseek() {
             new_offset = offset;
             break;
         case 1: // SEEK_CUR
-            new_offset = open_file.offset + offset;
+            new_offset = inode_file.offset + offset;
             break;
         case 2: { // SEEK_END 
-            auto inode_variant = inode_of(open_file.inode);
+            auto inode_variant = inode_of(inode_file.inode);
             if (auto missing = std::get_if<Missing>(&inode_variant)) {
                 return wait_for(missing->block);
             }
@@ -98,8 +104,134 @@ std::variant<Continue, Switch> Kernel::sys_lseek() {
         return Continue{};
     }
 
-    open_file.offset = new_offset;
+    inode_file.offset = new_offset;
     cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(new_offset));
+    return Continue{};
+}
+
+std::variant<Continue, Switch> Kernel::read_inode_file(InodeFile& inode_file, uint32_t addr, uint32_t count) {
+    auto node = inode_of(inode_file.inode);
+    if (auto missing = std::get_if<Missing>(&node)) {
+        return wait_for(missing->block);
+    }
+    const fs::Inode& inode = std::get<fs::Inode>(node);
+    if (inode_file.offset >= inode.size) {
+        cpu().set_reg(isa::reg::a0, 0);
+        return Continue{};
+    }
+    uint32_t bytes_to_read = std::min({count, inode.size - inode_file.offset, fs::kBlockSize - (inode_file.offset % fs::kBlockSize)});
+    uint32_t block_index = inode_file.offset / fs::kBlockSize;
+    auto block_variant = block_of(inode, block_index);
+    if (auto missing = std::get_if<Missing>(&block_variant)) {
+        return wait_for(missing->block);
+    }
+    uint32_t block_num = std::get<uint32_t>(block_variant);
+    auto block = cache_get(block_num);
+    if (!block) {
+        return wait_for(block_num);
+    }
+    for (uint32_t i = 0; i < bytes_to_read; ++i) {
+        auto access = try_access(addr + i, mmu::Access::store);
+        if (std::holds_alternative<Blocked>(access)) {
+            return retry_call();
+        }
+        if (std::holds_alternative<Fault>(access)) {
+            cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
+            return Continue{};
+        }
+    }
+    for (uint32_t i = 0; i < bytes_to_read; ++i) {
+        auto access = try_access(addr + i, mmu::Access::store);
+        assert(std::holds_alternative<uint32_t>(access));
+        bool wrote = ram().write(std::get<uint32_t>(access), 1, (*block)[inode_file.offset % fs::kBlockSize + i]);
+        assert(wrote);
+    }
+    cpu().set_reg(isa::reg::a0, bytes_to_read);
+    inode_file.offset += bytes_to_read;
+    return Continue{};
+}
+
+void Kernel::wake_pipe_waiters(Pipe& pipe) {
+    for (auto& [tid, thread] : thread_table_) {
+        if (thread.blocked == BlockReason::Pipe && thread.waiting_pipe == &pipe) {
+            thread.blocked = BlockReason::None;
+            thread.waiting_pipe = nullptr;
+        }
+    }
+}
+
+std::variant<Continue, Switch> Kernel::read_pipe(PipeFile& file, uint32_t addr, uint32_t count) {
+    if (file.end != PipeEnd::Read) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEbadf));
+        return Continue{};
+    }
+    if (count == 0) {
+        cpu().set_reg(isa::reg::a0, 0);
+        return Continue{};
+    }
+    if (file.pipe->count == 0 && file.pipe->write_open) {
+        thread().blocked = BlockReason::Pipe;
+        thread().waiting_pipe = file.pipe.get();
+        return retry_call();
+    }
+    uint32_t bytes_read = std::min(count, file.pipe->count);
+    for (uint32_t i = 0; i < bytes_read; ++i) {
+        auto access = try_access(addr + i, mmu::Access::store);
+        if (std::holds_alternative<Blocked>(access)) {
+            return retry_call();
+        }
+        if (std::holds_alternative<Fault>(access)) {
+            cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
+            return Continue{};
+        }
+    }
+    for (uint32_t i = 0; i < bytes_read; ++i) {
+        auto access = try_access(addr + i, mmu::Access::store);
+        assert(std::holds_alternative<uint32_t>(access));
+        bool wrote = ram().write(std::get<uint32_t>(access), 1, file.pipe->buffer[file.pipe->head]);
+        assert(wrote);
+        file.pipe->head = (file.pipe->head + 1) % kPipeSize;
+    }
+    cpu().set_reg(isa::reg::a0, bytes_read);
+    file.pipe->count -= bytes_read;
+    wake_pipe_waiters(*file.pipe);
+    return Continue{};
+}
+
+std::variant<Continue, Switch> Kernel::write_pipe(PipeFile& file, uint32_t addr, uint32_t count) {
+    if (file.end != PipeEnd::Write) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEbadf));
+        return Continue{};
+    }
+    if (!file.pipe->read_open) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEpipe));
+        return Continue{};
+    }
+    if (count == 0) {
+        cpu().set_reg(isa::reg::a0, 0);
+        return Continue{};
+    }
+    if (file.pipe->count == kPipeSize) {
+        thread().blocked = BlockReason::Pipe;
+        thread().waiting_pipe = file.pipe.get();
+        return retry_call();
+    }
+    uint32_t bytes_written = std::min(count, kPipeSize - file.pipe->count);
+    // Checks every user byte before the buffer changes, so -EFAULT adds nothing.
+    auto bytes = read_memory_on_ram(addr, bytes_written);
+    if (std::holds_alternative<Blocked>(bytes)) {
+        return retry_call();
+    }
+    if (std::holds_alternative<Fault>(bytes)) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
+        return Continue{};
+    }
+    for (uint8_t byte : std::get<std::vector<uint8_t>>(bytes)) {
+        file.pipe->buffer[(file.pipe->head + file.pipe->count) % kPipeSize] = byte;
+        ++file.pipe->count;
+    }
+    cpu().set_reg(isa::reg::a0, bytes_written);
+    wake_pipe_waiters(*file.pipe);
     return Continue{};
 }
 
@@ -112,45 +244,14 @@ std::variant<Continue, Switch> Kernel::sys_read() {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEbadf));
         return Continue{};
     }
-    auto node = inode_of(file->inode);
-    if (auto missing = std::get_if<Missing>(&node)) {
-        return wait_for(missing->block);
+    if (auto* inode_file = std::get_if<InodeFile>(&file->kind)) {
+        return read_inode_file(*inode_file, buffer_addr, bytes_count);
+    } else if (auto* pipe_file = std::get_if<PipeFile>(&file->kind)) {
+        return read_pipe(*pipe_file, buffer_addr, bytes_count);
+    } else {
+        assert(false && "Unknown file type");
     }
-    const fs::Inode& inode = std::get<fs::Inode>(node);
-    if (file->offset >= inode.size) {
-        cpu().set_reg(isa::reg::a0, 0);
-        return Continue{};
-    }
-    uint32_t bytes_to_read = std::min({bytes_count, inode.size - file->offset, fs::kBlockSize - (file->offset % fs::kBlockSize)});
-    uint32_t block_index = file->offset / fs::kBlockSize;
-    auto block_variant = block_of(inode, block_index);
-    if (auto missing = std::get_if<Missing>(&block_variant)) {
-        return wait_for(missing->block);
-    }
-    uint32_t block_num = std::get<uint32_t>(block_variant);
-    auto block = cache_get(block_num);
-    if (!block) {
-        return wait_for(block_num);
-    }
-    for (uint32_t i = 0; i < bytes_to_read; ++i) {
-        auto access = try_access(buffer_addr + i, mmu::Access::store);
-        if (std::holds_alternative<Blocked>(access)) {
-            return retry_call();
-        }
-        if (std::holds_alternative<Fault>(access)) {
-            cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
-            return Continue{};
-        }
-    }
-    for (uint32_t i = 0; i < bytes_to_read; ++i) {
-        auto access = try_access(buffer_addr + i, mmu::Access::store);
-        assert(std::holds_alternative<uint32_t>(access));
-        bool wrote = ram().write(std::get<uint32_t>(access), 1, (*block)[file->offset % fs::kBlockSize + i]);
-        assert(wrote);
-    }
-    cpu().set_reg(isa::reg::a0, bytes_to_read);
-    file->offset += bytes_to_read;
-    return Continue{};
+    
 }
 
 std::variant<Continue, Switch> Kernel::sys_exec() {
@@ -209,6 +310,11 @@ std::variant<Continue, Switch> Kernel::sys_exec() {
     page_table() = std::move(fresh);
     const auto& program = std::get<loader::Program>(loaded);
     process().brk = process().initial_break = program.initial_break;
+    for (const auto& [start_addr, region_id] : process().attachments) {
+        Region& region = region_table_.at(region_id);
+        --region.attachment_count;
+    }
+    process().attachments.clear();
     thread().context = {};
     thread().context.pc = program.entry;
     thread().context.regs[isa::reg::sp] = static_cast<uint32_t>(loader::kStackTop);
@@ -225,8 +331,44 @@ void Kernel::release_open_file(uint32_t entry) {
     assert(file_table_[entry]);
     OpenFile& open_file = *file_table_[entry];
     if (--open_file.refs == 0) {
+        if (auto pipe_file = std::get_if<PipeFile>(&open_file.kind)) {
+            if (pipe_file->end == PipeEnd::Read) {
+                pipe_file->pipe->read_open = false;
+            } else {
+                pipe_file->pipe->write_open = false;
+            }
+            wake_pipe_waiters(*pipe_file->pipe);
+        }
         file_table_[entry].reset();
     }
+}
+
+std::optional<std::array<uint32_t, 2>> Kernel::find_two_free_fds(const Process& process) const {
+    std::array<uint32_t, 2> found{};
+    uint32_t count = 0;
+    for (uint32_t fd = 3; fd < kMaxFileDescriptors; ++fd) {
+        if (!process.fd_table[fd]) {
+            found[count++] = fd;
+            if (count == 2) {
+                return found;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::array<uint32_t, 2>> Kernel::find_two_free_open_files() const {
+    std::array<uint32_t, 2> found{};
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < kMaxOpenFiles; ++i) {
+        if (!file_table_[i]) {
+            found[count++] = i;
+            if (count == 2) {
+                return found;
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 std::optional<uint32_t> Kernel::find_free_open_file() const {
@@ -286,7 +428,7 @@ Switch Kernel::block_on(uint32_t b) {
 }
 
 Switch Kernel::retry_call() {
-    assert(thread().blocked == BlockReason::IO);
+    assert(thread().blocked != BlockReason::None);
     cpu().pc -= 4;
     return Switch{};
 }

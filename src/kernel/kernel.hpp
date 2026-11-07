@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -49,10 +50,22 @@ struct CachedBlock {
     bool ready;
 };
 
+struct Region {
+    std::vector<std::optional<uint32_t> > frames;
+    uint32_t attachment_count = 0;
+};
+
+// A page inside one of a process's attachments.
+struct AttachedPage {
+    Region* region;
+    uint32_t index;   // the page's index in the region
+};
+
 // Instructions a process may run before the timer switches to the next one (spec A4).
 inline constexpr uint64_t kQuantum = 1000;
 inline constexpr uint32_t kMaxOpenFiles = 64;
 inline constexpr uint32_t kMaxPathBytes = 256;   // a path for open, with its zero byte
+inline constexpr uint32_t kMaxSharedRegions = 8;
 
 class Kernel {
 public :
@@ -98,11 +111,24 @@ public :
         disk::Request request;
     };
 
-    struct OpenFile {
+    enum class PipeEnd { Read, Write };
+
+    struct InodeFile {
         uint32_t inode{};
         uint32_t offset{};
+    };
+
+    // One end of a pipe. Both ends share the Pipe, which is freed with the last of them.
+    struct PipeFile {
+        std::shared_ptr<Pipe> pipe;
+        PipeEnd end = PipeEnd::Read;
+    };
+
+    struct OpenFile {
+        std::variant<InodeFile, PipeFile> kind;
         uint32_t refs{};
     };
+
 
     enum class EvictResult {
         Freed,
@@ -161,6 +187,7 @@ public :
 private : 
     uint32_t executing_tid_{};
     uint32_t next_pid_{};
+    uint32_t next_region_id{};
     std::map<uint32_t, Process> process_table_{};
     std::map<uint32_t, Thread> thread_table_{};
     std::map<uint32_t, Ending> ending_table_{};
@@ -169,9 +196,17 @@ private :
     std::ostream& err_;
     std::deque<PendingIO> pending_ios_;
     std::array<std::optional<OpenFile>, kMaxOpenFiles> file_table_{};
+    std::map<uint32_t, Region> region_table_{};
     std::unordered_map<uint32_t, CachedBlock> cached_blocks_{};
     std::array<uint32_t, fs::kSwapBlocks> slot_refs_{};
     uint32_t clock_hand_{};
+
+
+    std::variant<Continue, Switch> read_inode_file(InodeFile& file, uint32_t addr, uint32_t count);
+
+    void wake_pipe_waiters(Pipe& pipe);
+    std::variant<Continue, Switch> read_pipe(PipeFile& file, uint32_t addr, uint32_t count);
+    std::variant<Continue, Switch> write_pipe(PipeFile& file, uint32_t addr, uint32_t count);
 
 
     std::variant<Continue, Switch> disk_io(disk::Op op);
@@ -181,6 +216,13 @@ private :
     std::variant<Exited, Continue, Switch, ThreadExited> handle_syscall();
 
     std::variant<std::vector<uint8_t>, Blocked, Fault> read_memory_on_ram(uint32_t addr, uint32_t bytes_count); 
+
+    Continue sys_shmdt();
+    Continue sys_shmat();
+    Continue sys_shmget();
+    Continue sys_shmrm();
+    
+    std::variant<Continue, Switch> sys_pipe();
 
     ThreadExited sys_thread_exit();
 
@@ -292,6 +334,8 @@ private :
     }
 
     bool in_region(uint64_t addr);
+    // The attachment page of the current process that holds addr, if there is one.
+    std::optional<AttachedPage> find_attached_page(uint32_t addr);
 
     bool map_page(uint32_t vpn);
 
@@ -303,6 +347,10 @@ private :
 
     // The index of the first empty open-file slot, or nullopt. Doesn't take it.
     std::optional<uint32_t> find_free_open_file() const;
+
+    std::optional<std::array<uint32_t, 2>> find_two_free_fds(const Process& process) const;
+
+    std::optional<std::array<uint32_t, 2>> find_two_free_open_files() const;
 
     // The lowest empty fd from 3 up, or nullopt. Doesn't take it.
     std::optional<uint32_t> find_free_fd(const Process& process) const;

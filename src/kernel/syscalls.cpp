@@ -1,6 +1,7 @@
 // System calls (docs/machine-spec.md, B3) and the memory helpers they use.
 #include <algorithm>
 #include <cassert>
+#include <ranges>
 
 #include "kernel/abi.hpp"
 #include "kernel/kernel.hpp"
@@ -49,10 +50,161 @@ std::variant<Exited, Continue, Switch, ThreadExited> Kernel::handle_syscall() {
             return sys_thread_exit();
         case abi::kSysThreadJoin : 
             return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_thread_join());
-        
+        case abi::kSysPipe :
+            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_pipe());
+        case abi::kSysShmget :
+            return sys_shmget();
+        case abi::kSysShmrm : 
+            return sys_shmrm();
+        case abi::kSysShmat : 
+            return sys_shmat();
+        case abi::kSysShmdt : 
+            return sys_shmdt();
         default :
             return sys_other();
     }
+}
+
+Continue Kernel::sys_shmdt() {
+    uint32_t start_addr = cpu().reg(isa::reg::a0);
+    auto& attachments = process().attachments;
+    auto found = attachments.find(start_addr);
+    if (found == attachments.end()) { // invalid addr 
+        cpu().set_reg(isa::reg::a0, -abi::kEinval);
+        return Continue{};
+    }
+    uint32_t region_id = found->second;
+    Region& region = region_table_[region_id];
+    --region.attachment_count;
+    for (uint32_t addr = start_addr; addr < start_addr + region.frames.size() * mmu::kPageSize; addr += mmu::kPageSize) {
+        uint32_t vpn = addr >> mmu::kPageShift;
+        unmap_page(vpn);
+    }
+    attachments.erase(start_addr);
+    cpu().set_reg(isa::reg::a0, 0);
+    return Continue{};
+}
+
+Continue Kernel::sys_shmat() {
+    uint32_t region_id = cpu().reg(isa::reg::a0);
+    auto found_region = region_table_.find(region_id);
+    if (found_region == region_table_.end()) {
+        cpu().set_reg(isa::reg::a0, -abi::kEinval);
+        return Continue{};
+    }
+    Region& region = found_region->second;
+    uint32_t size = region.frames.size() * mmu::kPageSize;
+    uint32_t last = loader::kStackRegion;
+    for (const auto& [start_addr, existing_region_id] : process().attachments | std::views::reverse) {
+        uint32_t existing_size = region_table_[existing_region_id].frames.size() * mmu::kPageSize;
+        uint32_t free_size = last - (start_addr + existing_size);
+        if (free_size >= size) {
+            ++region.attachment_count;
+            process().attachments.emplace(last - size, region_id);
+            cpu().set_reg(isa::reg::a0, last - size);
+            return Continue{};
+        }
+        last = start_addr;
+    }
+    uint32_t free_size = last - process().brk;
+    if (free_size >= size) {
+        ++region.attachment_count;
+        process().attachments.emplace(last - size, region_id);
+        cpu().set_reg(isa::reg::a0, last - size);
+        return Continue{};
+    } else {
+        cpu().set_reg(isa::reg::a0, -abi::kEnomem);
+        return Continue{};
+    }
+}
+
+Continue Kernel::sys_shmget() {
+    int32_t size = static_cast<int32_t>(cpu().reg(isa::reg::a0));
+    if (size <= 0) {
+        cpu().set_reg(isa::reg::a0, -abi::kEinval);
+        return Continue{};
+    }
+    if (region_table_.size() == kMaxSharedRegions) {
+        cpu().set_reg(isa::reg::a0, -abi::kEnospc);
+        return Continue{};
+    }
+    uint32_t page_count = (static_cast<uint64_t>(size) + mmu::kPageSize - 1) / mmu::kPageSize;
+    Region region;
+    region.frames.resize(page_count);
+    uint32_t region_id = ++next_region_id;
+    region_table_.emplace(region_id, region);
+    assert(region_table_.size() <= kMaxSharedRegions);
+    cpu().set_reg(isa::reg::a0, region_id);
+    return Continue{};
+}
+Continue Kernel::sys_shmrm() {
+    uint32_t id = cpu().reg(isa::reg::a0);
+    auto it = region_table_.find(id);
+    if (it == region_table_.end()) {
+        cpu().set_reg(isa::reg::a0, -abi::kEinval);
+        return Continue{};
+    }
+    Region& region = it->second;
+    if (region.attachment_count > 0) {
+        cpu().set_reg(isa::reg::a0, -abi::kEbusy);
+        return Continue{};
+    }
+    for (auto frame : region.frames) {
+        if (!frame) continue;
+        frame_allocator().free(*frame);
+    }
+    region_table_.erase(id);
+    cpu().set_reg(isa::reg::a0, 0);
+    return Continue{};
+}
+
+std::variant<Continue, Switch> Kernel::sys_pipe() {
+    uint32_t fds_addr = cpu().reg(isa::reg::a0);
+    if (fds_addr % 4) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
+        return Continue{};
+    }
+    uint32_t read_fd_addr;
+    uint32_t write_fd_addr;
+    for (uint32_t addr : {fds_addr, fds_addr + 4}) {
+        auto access = try_access(addr, mmu::Access::store);
+        if (std::holds_alternative<Fault>(access)) {
+            cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEfault));
+            return Continue{};
+        }
+        if (std::holds_alternative<Blocked>(access)) {
+            thread().blocked = BlockReason::IO;
+            return retry_call();
+        }
+        if (addr == fds_addr) {
+            read_fd_addr = std::get<uint32_t>(access);
+        } else {
+            write_fd_addr = std::get<uint32_t>(access);
+        }
+    }
+    auto maybe_free_fds = find_two_free_fds(process());
+    if (!maybe_free_fds) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEmfile));
+        return Continue{};
+    }
+    auto maybe_free_open_files = find_two_free_open_files();
+    if (!maybe_free_open_files) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnfile));
+        return Continue{};
+    }
+    auto [read_fd, write_fd] = *maybe_free_fds;
+    auto [read_open_file, write_open_file] = *maybe_free_open_files;
+    std::shared_ptr<Pipe> pipe = std::make_shared<Pipe>();
+    OpenFile read_file{.kind = PipeFile{pipe, PipeEnd::Read}, .refs = 1};
+    OpenFile write_file{.kind = PipeFile{pipe, PipeEnd::Write}, .refs = 1};
+    file_table_[read_open_file] = std::move(read_file);
+    file_table_[write_open_file] = std::move(write_file);
+    process().fd_table[read_fd] = read_open_file;
+    process().fd_table[write_fd] = write_open_file;
+    ram().write(read_fd_addr, 4, read_fd);
+    ram().write(write_fd_addr, 4, write_fd);
+    cpu().set_reg(isa::reg::a0, 0);
+    return Continue{};
 }
 
 ThreadExited Kernel::sys_thread_exit() {
@@ -129,6 +281,12 @@ std::variant<Continue, Switch> Kernel::sys_write() {
     uint32_t buffer_addr = cpu().reg(isa::reg::a1);
     uint32_t bytes_count = cpu().reg(isa::reg::a2);
     if (fd != 1 && fd != 2) {
+        OpenFile* file = open_file_of(static_cast<uint32_t>(fd));
+        if (file) {
+            if (auto* pipe_file = std::get_if<PipeFile>(&file->kind)) {
+                return write_pipe(*pipe_file, buffer_addr, bytes_count);
+            }
+        }
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEbadf));
         return Continue{};
     }
@@ -160,6 +318,11 @@ Continue Kernel::sys_sbrk() {
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnomem));
         return Continue{};
     }
+    auto attachments = process().attachments;
+    if (attachments.size() && attachments.begin()->first < new_break) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEnomem));
+        return Continue{};
+    } 
     cpu().set_reg(isa::reg::a0, old_break);
     process().brk = new_break;
     if (n >= 0) {
@@ -187,6 +350,10 @@ Switch Kernel::sys_yield() {
 
 Continue Kernel::sys_fork() {
     Process copied = process();
+    for (const auto& [start_addr, region_id] : process().attachments) {
+        Region& region = region_table_.at(region_id);
+        ++region.attachment_count;
+    }
     copied.threads.clear();
     copied.parent_pid = process().pid;
     cpu::Context context = cpu().context();

@@ -9,6 +9,7 @@ This document defines the simulated machine: the "hardware" that user programs r
 - **Part C** describes the file system: how files are laid out on the disk, and how the kernel reads them.
 - **Part D** describes swapping.
 - **Part E** describes threads.
+- **Part F** describes communication between processes.
 
 Instruction behavior follows the [RISC-V Unprivileged ISA Specification](https://github.com/riscv/riscv-isa-manual/releases). This document only records the choices RISC-V leaves open and the places where we simplify.
 
@@ -239,6 +240,8 @@ Outside the simulated machine, the simulator (and tests) can read and write the 
            │ stack ↓                    │  up to 1 MiB
 0x7FF00000 ├────────────────────────────┤
            │                            │
+           │ shared memory (F2) ↓       │  attached top down
+           │                            │
            │ unmapped                   │
            │                            │
            ├────────────────────────────┤  ← current break
@@ -256,7 +259,7 @@ Outside the simulated machine, the simulator (and tests) can read and write the 
 - **User addresses are below `0x80000000`.** The upper half is reserved, so any access to it faults.
 - **Null guard:** `0x00000000`–`0x0000FFFF` is never mapped, so a null-pointer access faults.
 - **Stack:** the initial `sp` is `0x80000000`, which meets the RISC-V ABI's 16-byte alignment rule. The stack region is `0x7FF00000`–`0x7FFFFFFF`. The loader maps the top 16 pages (64 KiB) read+write. The rest of the region is mapped **on demand**: a load or store page fault at an unmapped stack address makes the kernel map a zero-filled read+write page and retry the instruction. A fault anywhere else, a permission fault (except a store to a copy-on-write page, see `fork` in B3), or a fault when no frame is free kills the process (a *segmentation fault*).
-- **Heap:** the initial break is the end of the highest loaded segment, rounded up to 4 KiB. It moves with `sbrk` and cannot grow past `0x7FF00000`. Heap pages are mapped **lazily**: `sbrk` only moves the break, and a page from the initial break up to the page holding the last heap byte is mapped (zero-filled, read+write) the first time it is accessed, like the stack. If no frame is free at that moment, the kernel evicts a page to make room (D4), and the process is killed only if it can't: a successful `sbrk` does not guarantee memory (*overcommit*).
+- **Heap:** the initial break is the end of the highest loaded segment, rounded up to 4 KiB. It moves with `sbrk` and cannot grow past `0x7FF00000`, or past the lowest shared memory attachment (F2). Heap pages are mapped **lazily**: `sbrk` only moves the break, and a page from the initial break up to the page holding the last heap byte is mapped (zero-filled, read+write) the first time it is accessed, like the stack. If no frame is free at that moment, the kernel evicts a page to make room (D4), and the process is killed only if it can't: a successful `sbrk` does not guarantee memory (*overcommit*).
 - **New pages are always zero-filled**, so a process can never see another process's old data.
 
 ## B2. Program format and loading
@@ -310,8 +313,13 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 | 16 | `thread_exit` | `a0` = status | Does not return | E |
 | 17 | `thread_join` | `a0` = thread id, `a1` = address to store the status (0: don't store) | The thread id | E |
 | 18 | `gettid` | | The caller's thread id | E |
+| 19 | `pipe` | `a0` = address of two words, to store the fds | 0 | F |
+| 20 | `shmget` | `a0` = size in bytes | A region id | F |
+| 21 | `shmat` | `a0` = region id | The address it is attached at | F |
+| 22 | `shmdt` | `a0` = address `shmat` returned | 0 | F |
+| 23 | `shmrm` | `a0` = region id | 0 | F |
 
-For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (11–14) and `exec` (7) are described in C3, the thread calls (15–18) in Part E.
+`write` supports fd 1 (stdout), fd 2 (stderr) and the write end of a pipe. The file calls (11–14) and `exec` (7) are described in C3, the thread calls (15–18) in Part E, `pipe` (19) and the shared memory calls (20–23) in Part F.
 
 `sbrk` returns `-EINVAL` if the new break would be below the initial break, and `-ENOMEM` if it would be above `0x7FF00000`. Otherwise it always succeeds: it maps nothing (see B1). Shrinking unmaps the heap pages the heap no longer covers; each of their frames is freed once no other mapping uses it (see `fork`).
 
@@ -355,17 +363,21 @@ For now, `write` supports only fd 1 (stdout) and fd 2 (stderr). The file calls (
 | `ECHILD` | 10 | No child to wait for |
 | `ENOMEM` | 12 | Out of memory |
 | `EFAULT` | 14 | Bad pointer passed to the kernel |
+| `EBUSY` | 16 | The region is still attached |
 | `ENOTDIR` | 20 | Not a directory |
 | `EINVAL` | 22 | Invalid argument |
 | `ENFILE` | 23 | The open-file table is full |
 | `EMFILE` | 24 | The process's fd table is full |
+| `ENOSPC` | 28 | The shared memory table is full |
+| `ESPIPE` | 29 | Can't seek on a pipe |
+| `EPIPE` | 32 | Writing to a pipe nobody can read |
 | `ENAMETOOLONG` | 36 | Path too long |
 | `ENOSYS` | 38 | Unknown system call number |
 
 **Rules:**
 
 - An unknown system call number returns `-ENOSYS`. The process is not killed.
-- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. A page that needs a frame when none is free, or that is swapped out, is handled as in D7. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed calls are a blocked `wait` or `thread_join`, a file-system call or `exec` blocked on a missing block (C2), and a call that waited for one of its pages (D7), which had none; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
+- The kernel checks every pointer a program passes in. If a buffer covers an address the process may not access, the call returns `-EFAULT`. If it covers a valid page that isn't mapped yet (a heap or stack page the program hasn't touched), the kernel maps the page and continues, exactly as a page fault would. A page that needs a frame when none is free, or that is swapped out, is handled as in D7. The `ECALL` is never re-executed after it has had side effects, so they can't happen twice. The only re-executed calls are a blocked `wait` or `thread_join`, a file-system call or `exec` blocked on a missing block (C2), and a call that waited for one of its pages (D7), which had none, a blocked `read` or `write` on a pipe (F1), which moved no bytes; a blocked `disk_read` or `disk_write` resumes after its `ECALL`.
 
 ---
 
@@ -466,7 +478,7 @@ Running the call again is safe because the look phase changed nothing. The call 
 **Open files: two tables** (L11, "File System in Action"):
 
 - The **open-file table** is system-wide: one entry per `open` call, holding the file's inode number and the **offset** (where the next `read` starts, initially 0). At most **64** entries.
-- Each process has an **fd table** of **16** slots, fds 0–15. A slot is empty or points to an open-file entry. Fds 0, 1 and 2 are stdin, stdout and stderr: they never point to an open-file entry, and `read`, `close` and `lseek` on them return `-EBADF`. (`write` keeps working on 1 and 2 as before; `write` on a file returns `-EBADF`.)
+- Each process has an **fd table** of **16** slots, fds 0–15. A slot is empty or points to an open-file entry. Fds 0, 1 and 2 are stdin, stdout and stderr: they never point to an open-file entry, and `read`, `close` and `lseek` on them return `-EBADF`. (`write` keeps working on 1 and 2 as before; `write` on a file returns `-EBADF`. Pipes are in Part F.)
 - `fork` copies the parent's fd table: each copied slot points to the **same** open-file entry, so parent and child share its offset (as in Unix). An entry is freed when no fd points to it any more: after `close`, or when a process ends (an ending process closes all its fds).
 
 **Paths.** `open` takes a path as a zero-terminated string in user memory, at most **256** bytes including the zero. It is read byte by byte like any user pointer (B3, Rules): an untouched heap or stack page is mapped, an inaccessible byte gives `-EFAULT`. No zero byte in the first 256 gives `-ENAMETOOLONG`. The path is then followed like `fs::resolve`: absolute, with empty names between slashes skipped, through the cache.
@@ -613,6 +625,89 @@ The only thing the kernel doesn't catch is threads that wait for each other fore
 ## E5. Swapping with threads
 
 Threads fault independently on one page table, so two can fault on the same swapped-out page. A fault on a page whose swap-in is already queued or running **doesn't queue a second read**, and needs no frame: the thread blocks and re-runs its instruction (or `ECALL`) when the page arrives. The completion wakes every thread waiting for that page.
+
+# Part F — Communication between processes
+
+Processes have separate memory, so they need the kernel's help to talk to each other (L4).
+
+## F1. Pipes
+
+A **pipe** is a one-way channel of bytes, first in first out, with two ends: bytes written into the **write end** come out of the **read end**. The bytes are kept in kernel memory, in a **circular buffer of 4096 bytes**, so every transfer is copied twice and goes through a system call. No frames are used.
+
+**`pipe(fds_addr)`** makes a pipe, stores the read end's fd at `fds_addr` and the write end's fd at `fds_addr + 4`, and returns 0. Each is the lowest empty fd ≥ 3, read end first.
+
+- `-EFAULT` if the two words can't be stored (not 4-byte aligned, like `SW`, or not writable, as for `wait`).
+- `-EMFILE` if the process has fewer than 2 empty fds. `-ENFILE` if the open-file table has fewer than 2 empty entries.
+- If it fails, nothing is created.
+
+**Two open-file entries.** Each end is its own entry in the open-file table (C3), with no inode and no offset. So everything C3 says about entries applies: `fork` shares them with the child, `exec` keeps them, and threads share them. That's how a parent and child end up holding the same pipe.
+
+**An end is closed** when its entry is freed, which is when no fd points to it any more: after `close`, or when a process ends. The pipe is freed with its second end.
+
+**`read(fd, buffer, count)`** on the read end:
+
+- If `count` is 0, it returns 0.
+- If the pipe holds bytes, it copies `min(count, bytes held)`, oldest first, and returns how many. It never waits for more, so it may return fewer than `count`.
+- If the pipe is empty and the write end is **open**, the caller blocks, and re-runs its `ECALL` when woken.
+- If the pipe is empty and the write end is **closed**, it returns 0: end of file.
+- `-EFAULT` if a byte can't be stored in the buffer. No bytes leave the pipe.
+
+**`write(fd, buffer, count)`** on the write end:
+
+- If the read end is **closed**, it returns `-EPIPE`, whatever `count` is. (Linux also sends a signal.)
+- If `count` is 0, it returns 0.
+- If the pipe has room, it copies `min(count, room)` and returns how many. It may return fewer than `count`, and the program calls `write` again for the rest. (Linux would block until everything is written. Here a call that has moved bytes is never re-run, by the rule in B3, so it returns instead.)
+- If the pipe is full, the caller blocks, and re-runs its `ECALL` when woken.
+- `-EFAULT` if a byte to be copied can't be read from the buffer. No bytes enter the pipe.
+
+**The wrong end.** `read` on a write end and `write` on a read end return `-EBADF`. `lseek` on either returns `-ESPIPE`.
+
+**Waking.** A thread blocked on a pipe wakes when something it may be waiting for happens. It then re-runs its call, and may block again.
+
+- A `read` that takes bytes wakes the threads blocked in `write` on that pipe. A `write` that adds bytes wakes those blocked in `read`.
+- Closing an end wakes all the threads blocked on that pipe: readers see end of file, and writers see `-EPIPE`.
+- A thread blocked on a pipe isn't waiting on the disk, so when its process ends, or `exec` ends it, it ends at once (E3, E4).
+
+**A reader that keeps the write end open never sees end of file.** The write end is still open, even if only the reader itself holds it. So it blocks forever, and nothing detects it (a deadlock, as in E2). This is why a program closes the ends it doesn't use.
+
+## F2. Shared memory
+
+A pipe copies every byte through the kernel. A shared memory region is the opposite: the kernel only sets it up, by mapping the same frames into several address spaces. After that, processes read and write it with ordinary loads and stores, and no system call is involved. The kernel doesn't coordinate them either, so a program that needs to wait does so itself (L4's master and worker spin on a flag).
+
+The calls follow L4's five steps: create, attach, use, detach, destroy.
+
+**`shmget(size)`** creates a region of `size` bytes, rounded up to whole pages, and returns its id. Ids count up from 1 and are never reused, and a failed call uses none. A region exists apart from any process: any process that knows the id can attach it, related or not.
+
+- It takes **no frames**. A page of the region gets its frame the first time any process touches it (see Page faults, below), so a region may be bigger than RAM.
+- Errors, in this order: `-EINVAL` if `size` ≤ 0 (as a signed number), `-ENOSPC` if **8** regions already exist.
+
+**`shmat(id)`** reserves an address range for the whole region in the caller's address space, and returns the address of its first byte. It maps nothing and takes no frames. Each process keeps a list of its attachments: start address, and which region.
+
+- The kernel picks the address: the **highest** free range that fits, below `0x7FF00000` (the stack region). A range is free if no other attachment overlaps it, and it doesn't go below the break.
+- A process may attach the same region more than once. Each attachment has its own address, and they show the same memory.
+- Errors: `-EINVAL` if no region has that id, `-ENOMEM` if no range fits.
+
+**`shmdt(addr)`** removes the attachment that starts at `addr` and any of its pages the process had mapped, so a later access to it faults. Other attachments and the region's bytes are unaffected. Error: `-EINVAL` if no attachment of the caller starts at `addr`, including an address inside one.
+
+**Page faults.** A fault on an unmapped page inside an attachment is not an error, whether it comes from an instruction or from a system call using a buffer there. The page index in the region is `(addr - start) / 4096`, the same for every process however it attached. The region keeps a table of page index → frame:
+
+- If that page has a frame, map it read+write. This needs no new frame.
+- If not, get a frame like any other fault, evicting if none is free (D4), and killing the process if nothing can be evicted. Zero-fill it, record it in the table, and map it.
+
+**The region holds its own reference to each frame it has**, on top of one for each mapping. So detaching can't free a frame while the region still lists it, and the bytes are still there for the next attachment.
+
+**`shmrm(id)`** destroys a region and drops its references to its frames.
+
+- Errors: `-EINVAL` if no region has that id, `-EBUSY` if it is attached anywhere. (L4's rule. Linux instead marks the region and destroys it after the last detach.)
+- **A region that is never destroyed stays**, even when no process is left, until the machine stops.
+
+**With the rest of the kernel:**
+
+- **`fork`:** the child gets the parent's attachments at the same addresses, and they stay truly shared. Pages inside them are **not** copy-on-write, unlike all its other writable pages. `fork` can tell because a shared page's address falls inside one of the process's attachments, so no extra bit is stored in the page table entry.
+- **`exec`** (on success), **`exit`, and being killed** detach everything the process had attached. The region itself stays.
+- **Threads** share their process's attachments, like the rest of its memory.
+- **`sbrk`** returns `-ENOMEM` if the new break would go past the lowest attachment.
+- **Swapping:** a region's frames are never evicted (they are *pinned*). A mapped one has the region's reference and at least one more, and CLOCK only picks a frame with a single reference. (Linux can swap shared pages, using a reverse map to update every page table entry.)
 
 ---
 

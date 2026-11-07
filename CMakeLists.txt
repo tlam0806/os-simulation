@@ -93,6 +93,8 @@ add_executable(ossim_tests
   tests/clock_test.cpp
   tests/swap_test.cpp
   tests/kernel_thread_test.cpp
+  tests/kernel_pipe_test.cpp
+  tests/kernel_shm_test.cpp
 )
 target_link_libraries(ossim_tests PRIVATE ossim_core)
 add_test(NAME ossim_tests COMMAND ossim_tests)

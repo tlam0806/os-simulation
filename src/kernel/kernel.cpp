@@ -1,5 +1,7 @@
 // The kernel core: traps, the process table, and the scheduler.
 // System calls are in syscalls.cpp.
+#include <cstdio>
+#include <cstdlib>
 #include <cassert>
 #include <memory>
 
@@ -19,10 +21,26 @@ uint32_t Kernel::create_process(Process&& process, const cpu::Context& context) 
     return pid;
 }
 
+// OSSIM_TRACE=1 prints every system call and page fault to stderr, for debugging.
+static bool tracing() {
+    static const bool on = std::getenv("OSSIM_TRACE") != nullptr;
+    return on;
+}
+
 std::variant<Exited, Killed, Continue, Switch, ThreadExited> Kernel::handle_trap(const cpu::Trap& trap) {
     switch (trap.cause) {
-        case cpu::Cause::ecall :
-            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(handle_syscall());
+        case cpu::Cause::ecall : {
+            const uint32_t tid = executing_tid_;
+            const uint32_t number = cpu().reg(isa::reg::a7);
+            const uint32_t arg0 = cpu().reg(isa::reg::a0), arg1 = cpu().reg(isa::reg::a1), arg2 = cpu().reg(isa::reg::a2);
+            auto result = util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(handle_syscall());
+            if (tracing()) {
+                std::fprintf(stderr, "[t%u] syscall %u(%#x, %#x, %#x) -> a0=%d%s\n", tid, number, arg0, arg1, arg2,
+                             static_cast<int32_t>(cpu().reg(isa::reg::a0)),
+                             std::holds_alternative<Switch>(result) ? " (switched: blocked or yielded)" : "");
+            }
+            return result;
+        }
         case cpu::Cause::disk_interrupt :
             return handle_disk_interrupt();        
         case cpu::Cause::timer_interrupt :
@@ -30,7 +48,16 @@ std::variant<Exited, Killed, Continue, Switch, ThreadExited> Kernel::handle_trap
         case cpu::Cause::load_page_fault :
         case cpu::Cause::store_page_fault : 
         case cpu::Cause::instruction_page_fault :
-            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(handle_page_fault(trap));
+        {
+            const uint32_t tid = executing_tid_;
+            auto result = util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(handle_page_fault(trap));
+            if (tracing()) {
+                std::fprintf(stderr, "[t%u] page fault at %#x, pc %#x -> %s\n", tid, trap.tval, trap.pc,
+                             std::holds_alternative<Killed>(result) ? "killed" :
+                             std::holds_alternative<Switch>(result) ? "switched: waiting" : "handled");
+            }
+            return result;
+        }
         default :
             return Killed{trap};   // any fault ends the process
     }
@@ -169,6 +196,10 @@ void Kernel::end_process(uint32_t pid) {
         if (ending.parent_pid == process.pid) {
             ending.parent_pid = init;
         }
+    }
+    for (const auto& [start_addr, region_id] : process.attachments) {
+        Region& region = region_table_.at(region_id);
+        --region.attachment_count;
     }
     Ending ending{process.parent_pid, *process.status, false};
     ending_table_.emplace(process.pid, ending);

@@ -12,15 +12,28 @@ std::variant<Killed, Continue, Switch> Kernel::handle_page_fault(const cpu::Trap
     uint32_t addr = trap.tval;
     uint32_t vpn = mmu::get_vpn(addr);
     auto found = page_table().lookup(vpn);
+    // the frame is waiting for I/O
     for (const PendingIO& io : pending_ios_) {
         if (const SwapIn* swap_in = std::get_if<SwapIn>(&io.owner)) {
-            if (swap_in->vpn == vpn) {
+            if (swap_in->vpn == vpn && swap_in->pid == process().pid) {
                 thread().waiting_page = vpn;
                 thread().blocked = kernel::BlockReason::IO;
                 return Switch{};
             }
         }
     }
+    // finding if the page is attached to a region page 
+    if (!found) {
+        if (auto page = find_attached_page(addr); page && page->region->frames[page->index]) {
+            // the frame is already loaded on ram
+            uint32_t physical_frame = *page->region->frames[page->index];
+            mmu::Pte pte{.frame = physical_frame, .read = true, .write = true};
+            frame_allocator().share(physical_frame);
+            page_table().map(vpn, pte);
+            return Continue{};
+        }
+    }
+    // swap out a frame to make place
     if (fault_needs_frame(found, trap) && frame_allocator().free_count() == 0) {
         auto evict_result = evict();
         if (evict_result == EvictResult::Failed) {
@@ -29,11 +42,13 @@ std::variant<Killed, Continue, Switch> Kernel::handle_page_fault(const cpu::Trap
             return Switch{};
         }
     }
+    // swap in
     if (found && !found->valid) {
         assert(found->swap_slot);
         swap_in(vpn, *found);
         return Switch{};
     }
+    // invalid address
     if (!in_region(addr)) {
         return Killed{trap};
     }
@@ -47,8 +62,8 @@ std::variant<Killed, Continue, Switch> Kernel::handle_page_fault(const cpu::Trap
         }
     }
     assert(found);
-    
-    if (trap.cause == cpu::Cause::store_page_fault && found->cow) { // copy-on-write
+    // copy-on-write
+    if (trap.cause == cpu::Cause::store_page_fault && found->cow) { 
         auto new_pte = handle_cow(*found);
         if (!new_pte) {
             return Killed{trap};
@@ -73,7 +88,8 @@ mmu::PageTable Kernel::share_table(mmu::PageTable& other) {
         if (pte->swap_slot) {
             ++slot_refs_[*pte->swap_slot];
         }
-        if (pte->write) {
+        auto attached = find_attached_page(vpn << mmu::kPageShift);
+        if (pte->write && !attached) {
             pte->write = false;
             pte->cow = true;
             other.map(vpn, *pte);
@@ -140,8 +156,19 @@ bool Kernel::in_region(uint64_t large_addr) {
     uint32_t last_vpn = mmu::get_vpn(current_break() - 1);
     if (first_vpn <= vpn && vpn <= last_vpn) {
         return true;
+    }   
+    return find_attached_page(addr).has_value();
+}
+
+std::optional<AttachedPage> Kernel::find_attached_page(uint32_t addr) {
+    for (const auto& [start_addr, region_id] : process().attachments) {
+        Region& region = region_table_.at(region_id);
+        uint32_t size = region.frames.size() * mmu::kPageSize;
+        if (start_addr <= addr && addr < start_addr + size) {
+            return AttachedPage{&region, (addr - start_addr) / mmu::kPageSize};
+        }
     }
-    return false;
+    return std::nullopt;
 }
 
 void Kernel::swap_in(uint32_t vpn, const mmu::Pte& pte) {
@@ -162,6 +189,12 @@ void Kernel::swap_in(uint32_t vpn, const mmu::Pte& pte) {
 bool Kernel::map_page(uint32_t vpn) {
     std::optional<uint32_t> physical_frame = frame_allocator().allocate();
     if (!physical_frame) return false;
+    // check if the vpn is in any attachment 
+    if (auto page = find_attached_page(vpn * mmu::kPageSize)) {
+        assert(!page->region->frames[page->index]);
+        page->region->frames[page->index] = *physical_frame;
+        frame_allocator().share(*physical_frame); // the region holds one reference to the frame
+    }
     mmu::Pte pte{.frame = *physical_frame, .read = true, .write = true};
     zero_frame(*physical_frame);
     page_table().map(vpn, pte);
