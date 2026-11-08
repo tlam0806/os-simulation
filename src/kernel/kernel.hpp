@@ -201,6 +201,12 @@ private :
     std::array<uint32_t, fs::kSwapBlocks> slot_refs_{};
     uint32_t clock_hand_{};
 
+    // Writes ctx as a signal frame at addr: word 0 = pc, word i = x_i.
+    std::variant<Continue, Switch, Killed> write_context(uint32_t addr, const cpu::Context& ctx);
+
+    // Reads a signal frame at addr into ctx.
+    std::variant<Continue, Switch, Killed> read_context(uint32_t addr, cpu::Context& ctx);
+
 
     std::variant<Continue, Switch> read_inode_file(InodeFile& file, uint32_t addr, uint32_t count);
 
@@ -213,9 +219,17 @@ private :
     
     std::variant<Exited, Killed, Continue, Switch, ThreadExited> handle_trap(const cpu::Trap& trap);
     
-    std::variant<Exited, Continue, Switch, ThreadExited> handle_syscall();
+    std::variant<Exited, Killed, Continue, Switch, ThreadExited> handle_syscall();
 
     std::variant<std::vector<uint8_t>, Blocked, Fault> read_memory_on_ram(uint32_t addr, uint32_t bytes_count); 
+
+    // signal
+    std::variant<Continue, Switch, Killed> deliver_signal();
+    // Pushes the frame and jumps to sig's handler (the action must be a handler).
+    std::variant<Continue, Switch, Killed> run_handler(uint32_t sig);
+    std::variant<Continue, Switch, Killed> sys_sig_return();
+    Continue sys_kill();
+    Continue sys_signal();
 
     Continue sys_shmdt();
     Continue sys_shmat();

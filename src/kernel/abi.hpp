@@ -30,11 +30,25 @@ inline constexpr uint32_t kSysShmget = 20;
 inline constexpr uint32_t kSysShmat = 21;
 inline constexpr uint32_t kSysShmdt = 22;
 inline constexpr uint32_t kSysShmrm = 23;
+inline constexpr uint32_t kSysSignal = 24;
+inline constexpr uint32_t kSysKill = 25;
+inline constexpr uint32_t kSysSigreturn = 26;
+
+// Signal numbers (spec F3), Linux's values.
+inline constexpr uint32_t kSigkill = 9;
+inline constexpr uint32_t kSigusr1 = 10;
+inline constexpr uint32_t kSigsegv = 11;
+inline constexpr uint32_t kSigusr2 = 12;
+inline constexpr uint32_t kSigpipe = 13;
+
+// signal()'s handler values that aren't addresses.
+inline constexpr uint32_t kSigDefault = 0;
+inline constexpr uint32_t kSigIgnore = 1;
 
 // Error codes, using Linux's values. A failed call returns -code in a0.
 // (Not EBADF etc.: those names are macros in <errno.h>.)
 inline constexpr int32_t kEnoent = 2;   // no such file or directory
-inline constexpr int32_t kEsrch = 3;    // no such thread
+inline constexpr int32_t kEsrch = 3;    // no such thread or process
 inline constexpr int32_t kEnoexec = 8;  // not an executable file
 inline constexpr int32_t kEbadf = 9;    // bad file descriptor
 inline constexpr int32_t kEchild = 10;  // no child to wait for

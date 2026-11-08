@@ -426,7 +426,7 @@ bool killed_by_store_fault(System& s, uint32_t pid) {
     CHECK(e.has_value());
     const auto* killed = e ? std::get_if<kernel::Killed>(&e->status) : nullptr;
     CHECK(killed != nullptr);
-    return killed && killed->trap.cause == cpu::Cause::store_page_fault;
+    return killed && std::get<cpu::Trap>(killed->reason).cause == cpu::Cause::store_page_fault;
 }
 
 }  // namespace

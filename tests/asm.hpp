@@ -14,7 +14,8 @@ inline constexpr int32_t SYS_EXIT = 1, SYS_WRITE = 2, SYS_SBRK = 3, SYS_GETPID =
                          SYS_OPEN = 11, SYS_CLOSE = 12, SYS_READ = 13, SYS_LSEEK = 14,
                          SYS_THREAD_CREATE = 15, SYS_THREAD_EXIT = 16, SYS_THREAD_JOIN = 17, SYS_GETTID = 18,
                          SYS_PIPE = 19,
-                         SYS_SHMGET = 20, SYS_SHMAT = 21, SYS_SHMDT = 22, SYS_SHMRM = 23;
+                         SYS_SHMGET = 20, SYS_SHMAT = 21, SYS_SHMDT = 22, SYS_SHMRM = 23,
+                         SYS_SIGNAL = 24, SYS_KILL = 25, SYS_SIGRETURN = 26;
 
 struct Asm {
     using enum isa::Op;

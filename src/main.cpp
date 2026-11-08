@@ -95,7 +95,12 @@ int run(int argc, char** argv) {
             single_status = exited->exit_status;
             all_ok = all_ok && exited->exit_status == 0;
         } else {
-            std::cerr << "was killed by a trap:\n" << std::get<kernel::Killed>(ending->status).trap;
+            const auto& reason = std::get<kernel::Killed>(ending->status).reason;
+            if (const auto* trap = std::get_if<cpu::Trap>(&reason)) {
+                std::cerr << "was killed by a trap:\n" << *trap;
+            } else {
+                std::cerr << "was killed by signal " << std::get<kernel::Signal>(reason).number << "\n";
+            }
             all_ok = false;
         }
     }

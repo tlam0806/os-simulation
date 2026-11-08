@@ -43,6 +43,15 @@ void pipe_at(Asm& a, uint32_t fds_addr) {
 }
 
 // Makes the program's pipe: it must get kRead and kWrite.
+// signal(SIGPIPE, ignore): a write with no reader returns -EPIPE instead of
+// ending the writer (spec F3). Before signals exist, the call is just -ENOSYS.
+void ignore_sigpipe(Asm& a) {
+    a.li(a0, 13);
+    a.li(a1, 1);
+    a.li(a2, 0);
+    a.syscall(SYS_SIGNAL);
+}
+
 void make_pipe(Asm& a) {
     pipe_at(a, kFds);
     expect(a, a0, 0, kBad);
@@ -546,6 +555,7 @@ TEST(pipe_close_writing_with_no_reader_is_epipe) {
     Strings str;
     const uint32_t x = str.add("x");
     Asm a;
+    ignore_sigpipe(a);
     make_pipe(a);
     close(a, kRead);
     write_to(a, kWrite, x, 1);
@@ -578,6 +588,7 @@ TEST(pipe_close_wakes_a_blocked_writer) {
     // The child fills the pipe and blocks on one more byte. The parent closes the
     // last read end, so the child's write returns -EPIPE.
     Asm a;
+    ignore_sigpipe(a);                      // the child keeps it
     make_pipe(a);
     size_t to_parent;
     fork_to_parent(a, to_parent);

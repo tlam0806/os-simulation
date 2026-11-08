@@ -318,8 +318,11 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 | 21 | `shmat` | `a0` = region id | The address it is attached at | F |
 | 22 | `shmdt` | `a0` = address `shmat` returned | 0 | F |
 | 23 | `shmrm` | `a0` = region id | 0 | F |
+| 24 | `signal` | `a0` = signal, `a1` = handler (0: default, 1: ignore), `a2` = restorer | 0 | F |
+| 25 | `kill` | `a0` = pid, `a1` = signal | 0 | F |
+| 26 | `sigreturn` | — | Does not return: restores the interrupted context | F |
 
-`write` supports fd 1 (stdout), fd 2 (stderr) and the write end of a pipe. The file calls (11–14) and `exec` (7) are described in C3, the thread calls (15–18) in Part E, `pipe` (19) and the shared memory calls (20–23) in Part F.
+`write` supports fd 1 (stdout), fd 2 (stderr) and the write end of a pipe. The file calls (11–14) and `exec` (7) are described in C3, the thread calls (15–18) in Part E, `pipe` (19), the shared memory calls (20–23) and the signal calls (24–26) in Part F.
 
 `sbrk` returns `-EINVAL` if the new break would be below the initial break, and `-ENOMEM` if it would be above `0x7FF00000`. Otherwise it always succeeds: it maps nothing (see B1). Shrinking unmaps the heap pages the heap no longer covers; each of their frames is freed once no other mapping uses it (see `fork`).
 
@@ -338,7 +341,7 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 **`wait`** lets a parent collect a child that has ended:
 
 - It waits for a child of the caller that has ended: the one with pid `a0`, or any child if `a0` is −1. If such a child has already ended, it returns at once. Otherwise the caller is **blocked**: the scheduler skips it, so it runs no instructions, until a matching child ends (exits or is killed). That makes the caller runnable again. While blocked, its `pc` stays on the `ECALL`, so when it is next scheduled the `wait` runs again and collects the child. A blocked `wait` changed nothing, so running it again is safe.
-- It returns the child's pid. If `a1` isn't 0, it stores the child's status there as a 32-bit word: the exit status if the child called `exit`, or 128 + the trap cause if it was killed. Then the child is forgotten: a second `wait` can't collect it again.
+- It returns the child's pid. If `a1` isn't 0, it stores the child's status there as a 32-bit word: the exit status if the child called `exit`, 128 + the trap cause if a fault killed it, or 256 + the signal number if a signal killed it (F3). Then the child is forgotten: a second `wait` can't collect it again.
 - If the caller has no child matching `a0` (ended or still running), it returns `-ECHILD` at once.
 - If `a1` isn't 0 and the status can't be stored there (the address isn't 4-byte aligned, like `SW`, or isn't writable by the caller), it returns `-EFAULT` and the child is **not** collected. Like `write`, the kernel maps an untouched heap or stack page first.
 - A child whose parent has ended has no parent; nobody can wait for it.
@@ -357,7 +360,7 @@ The call numbers are our own, not Linux's, because we don't aim to run Linux bin
 | Name | Value | Meaning |
 |---|---|---|
 | `ENOENT` | 2 | No such file or directory |
-| `ESRCH` | 3 | No such thread |
+| `ESRCH` | 3 | No such thread or process |
 | `ENOEXEC` | 8 | Not an executable file |
 | `EBADF` | 9 | Bad file descriptor |
 | `ECHILD` | 10 | No child to wait for |
@@ -654,7 +657,7 @@ A **pipe** is a one-way channel of bytes, first in first out, with two ends: byt
 
 **`write(fd, buffer, count)`** on the write end:
 
-- If the read end is **closed**, it returns `-EPIPE`, whatever `count` is. (Linux also sends a signal.)
+- If the read end is **closed**, it returns `-EPIPE`, whatever `count` is, and sends `SIGPIPE` to the caller's process (F3). By default that kills the writer, so a program that wants to see `-EPIPE` ignores `SIGPIPE`.
 - If `count` is 0, it returns 0.
 - If the pipe has room, it copies `min(count, room)` and returns how many. It may return fewer than `count`, and the program calls `write` again for the rest. (Linux would block until everything is written. Here a call that has moved bytes is never re-run, by the rule in B3, so it returns instead.)
 - If the pipe is full, the caller blocks, and re-runs its `ECALL` when woken.
@@ -708,6 +711,58 @@ The calls follow L4's five steps: create, attach, use, detach, destroy.
 - **Threads** share their process's attachments, like the rest of its memory.
 - **`sbrk`** returns `-ENOMEM` if the new break would go past the lowest attachment.
 - **Swapping:** a region's frames are never evicted (they are *pinned*). A mapped one has the region's reference and at least one more, and CLOCK only picks a frame with a single reference. (Linux can swap shared pages, using a reverse map to update every page table entry.)
+
+## F3. Signals
+
+A **signal** is an asynchronous notification sent to a process (L4): another process, or the kernel itself, tells it that something happened. The process decides in advance what each signal does: its *action*.
+
+**Signals** use Linux's numbers:
+
+| Name | Number | Sent by | Default action |
+|---|---|---|---|
+| `SIGKILL` | 9 | `kill` | End the process. Can't be caught or ignored |
+| `SIGUSR1` | 10 | `kill` | End the process |
+| `SIGSEGV` | 11 | `kill`, or a page fault (below) | End the process |
+| `SIGUSR2` | 12 | `kill` | End the process |
+| `SIGPIPE` | 13 | `kill`, or a `write` to a pipe with no reader (F1) | End the process |
+
+A process ended by a signal has the status **256 + the signal number** for `wait`, for example 266 for `SIGUSR1`. A fault that ends it keeps the status 128 + the trap cause (B3).
+
+**Actions.** Each process has an action for each signal: **default** (end the process), **ignore**, or a **handler**, a function in the program. A new process starts with every action default. Threads share their process's actions.
+
+**`signal(sig, handler, restorer)`** sets the action for `sig` and returns 0. `handler` 0 means default, 1 means ignore, and any other value is the address of a handler. For a handler, `restorer` is the address of the program's own code that calls `sigreturn` (step 5 below). It is ignored otherwise. Neither address is checked. Error: `-EINVAL` if `sig` isn't one of the five signals, or is `SIGKILL`.
+
+**`kill(pid, sig)`** sends `sig` to the process `pid` and returns 0. Errors, in this order: `-EINVAL` if `sig` isn't one of the five signals (0 included), `-ESRCH` if no process with that pid is running (one that has ended doesn't count, even before it is collected). What happens depends on the target's action for `sig`:
+
+- **Ignore:** nothing. The signal is dropped.
+- **Default** (and always for `SIGKILL`): the target ends at once, as if killed, with status 256 + `sig`. Its threads end as in E3, including ones blocked on a pipe or in `wait`. If the target is the caller's own process, the call never returns.
+- **Handler:** the signal becomes **pending** for the target. Each process has one pending flag per signal, so sending a signal that is already pending changes nothing: signals don't queue. Then every thread of the target that is blocked in `wait`, `thread_join` or on a pipe is **woken** (see Blocked threads). A thread waiting for the disk (a disk request, a missing block, or a swapped-out page) is not woken.
+
+**Delivery.** Whenever the kernel is about to run a thread's instructions (it was just picked to run, or a trap it raised is handled and it carries on), and the thread's process has a pending signal, the kernel takes the **lowest-numbered** one off and delivers it to that thread. Only one signal is delivered at a time: a second pending signal is delivered the next time the thread resumes, for example when the first handler's `sigreturn` is done. If the action is no longer a handler by then, the signal is dropped (ignore) or ends the process (default). Otherwise:
+
+1. **Save.** The kernel pushes a **signal frame** onto the thread's stack: `frame = (sp & ~15) − 128`. The frame is 32 words: word 0 is the `pc` the thread was about to run, and word *i* is register x*i*, for *i* from 1 to 31 (word 2 is the old `sp`).
+2. **Redirect.** It sets `pc` = the handler, `a0` = the signal number, `ra` = the restorer, and `sp` = the frame. Every other register keeps its value.
+3. **Run.** The handler is ordinary code. It may use any register, as long as `sp` and `ra` are as it found them when it returns (as for any function). It may also call `exit` instead of returning.
+4. **Return.** The handler's `ret` jumps to the restorer.
+5. **`sigreturn`.** The restorer is code in the program that calls `sigreturn`. That call reads the frame at `sp` and puts every register and `pc` back as it was saved, so the thread carries on exactly where it was interrupted. It doesn't return a value, because `a0` is restored too.
+
+So a signal sent to the caller's own process, with a handler, runs the handler as soon as `kill` returns: the saved `a0` is `kill`'s 0, and the saved `pc` is the instruction after the `ECALL`.
+
+**The frame is ordinary user memory**, written and read like any buffer a system call uses (B3): an untouched stack page is mapped, and copy-on-write is broken. A handler may change the saved words, and `sigreturn` restores whatever it finds. If the frame can't be written, or `sigreturn` can't read it, the process ends with `SIGSEGV`'s status, 267. If a page of it is swapped out, the thread waits for it as in D7, and delivery or `sigreturn` is tried again.
+
+**Nesting.** A handler is code like any other, so a signal can arrive while it runs, even its own. The new frame goes below the first one, and each `sigreturn` removes one frame, the newest first.
+
+**Blocked threads.** A woken thread has its `pc` on its `ECALL`, like any blocked thread. So the handler runs first, and after its `sigreturn` the call runs again, and may block again. (Linux returns `-EINTR` by default and only restarts the call for a handler set up with `SA_RESTART`. Here the call always runs again.)
+
+**Faults.** A page fault that would kill the process (B1) delivers `SIGSEGV` to the faulting thread instead, at once, **if the process has a handler for `SIGSEGV`**. The saved `pc` is the faulting instruction, so if the handler returns without changing it, the instruction runs again and faults again. Otherwise the process is killed as before, with status 128 + the cause, **even if `SIGSEGV` is ignored**. Other faults (B3) are unchanged.
+
+**With the rest of the kernel:**
+
+- **`fork`:** the child gets the parent's actions. It has no pending signals.
+- **`exec`** (on success): every handler becomes default, because its address means nothing in the new program. Ignored signals stay ignored, and pending signals stay pending.
+- **Threads** share the actions and the pending flags. A signal goes to whichever of the process's threads runs next.
+
+**Not in scope:** blocking signals (a signal mask), so a handler can be interrupted by its own signal; `-EINTR`; signals that queue; other signals such as `SIGCHLD`, `SIGSTOP` and `SIGCONT`; and sending a signal to one thread.
 
 ---
 

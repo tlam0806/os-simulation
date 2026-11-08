@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <variant>
 
 #include "cpu/cpu.hpp"
 #include "mmu/page_table.hpp"
@@ -11,13 +12,20 @@ namespace kernel {
 const uint32_t init = 0;
 inline constexpr uint32_t kMaxFileDescriptors = 16;
 inline constexpr uint32_t kPipeSize = 4096;        // bytes, one page
+inline constexpr uint32_t kMaxSingals = 32;
 
 
 struct Exited {
     int32_t exit_status = 0;    
 };
+// The signal that ended a process (spec F3).
+struct Signal {
+    uint32_t number = 0;
+};
+
+// A process was killed: by a fault (its trap) or by a signal.
 struct Killed {
-    cpu::Trap trap;
+    std::variant<cpu::Trap, Signal> reason;
 };
 
 enum class BlockReason {
@@ -46,6 +54,11 @@ struct Thread {
     Pipe* waiting_pipe = nullptr; // the pipe the process is waiting on (spec F1)
 };
 
+struct SignalAction {
+    uint32_t handler = 0;
+    uint32_t restorer = 0;
+};
+
 struct Process {
     std::array<std::optional<uint32_t>, kernel::kMaxFileDescriptors> fd_table{};
     uint32_t parent_pid = 0;
@@ -57,6 +70,8 @@ struct Process {
     std::map<uint32_t, int32_t> ended_threads{};
     std::optional<std::variant<Exited, Killed>> status;
     std::map<uint32_t, uint32_t> attachments; // starting address -> region id 
+    std::array<SignalAction, kMaxSingals> signal_actions{};
+    uint32_t pending_flags = 0;
 };
 
 }  // namespace kernel

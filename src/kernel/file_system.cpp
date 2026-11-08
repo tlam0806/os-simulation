@@ -204,7 +204,12 @@ std::variant<Continue, Switch> Kernel::write_pipe(PipeFile& file, uint32_t addr,
         return Continue{};
     }
     if (!file.pipe->read_open) {
+        SignalAction action = process().signal_actions[abi::kSigpipe];
         cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEpipe));
+        if (action.handler != abi::kSigIgnore) {
+            process().pending_flags |= (1 << abi::kSigpipe);
+            return Continue{};
+        }
         return Continue{};
     }
     if (count == 0) {
@@ -309,6 +314,11 @@ std::variant<Continue, Switch> Kernel::sys_exec() {
     free_address_space(process().page_table);
     page_table() = std::move(fresh);
     const auto& program = std::get<loader::Program>(loaded);
+    for (SignalAction& singal_action : process().signal_actions) {
+        if (singal_action.handler != abi::kSigDefault && singal_action.handler != abi::kSigIgnore) {
+            singal_action = {};
+        }
+    }
     process().brk = process().initial_break = program.initial_break;
     for (const auto& [start_addr, region_id] : process().attachments) {
         Region& region = region_table_.at(region_id);

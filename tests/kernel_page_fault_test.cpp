@@ -55,7 +55,7 @@ struct System {
         const auto e = k.ending(pid);
         const auto* killed = e ? std::get_if<kernel::Killed>(&e->status) : nullptr;
         CHECK(killed != nullptr);
-        return killed ? killed->trap : cpu::Trap{};
+        return killed ? std::get<cpu::Trap>(killed->reason) : cpu::Trap{};
     }
 };
 

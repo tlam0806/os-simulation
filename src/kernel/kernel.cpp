@@ -1,15 +1,89 @@
 // The kernel core: traps, the process table, and the scheduler.
 // System calls are in syscalls.cpp.
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cassert>
 #include <memory>
 
+#include "kernel/abi.hpp"
 #include "kernel/kernel.hpp"
 #include "loader/elf.hpp"
 #include "util/variant.hpp"
 
 namespace kernel {
+
+std::variant<Continue, Switch, Killed> Kernel::write_context(uint32_t start_addr, const cpu::Context& ctx) {
+    for (uint32_t i = 0; i < 32; ++i) {
+        uint32_t logical_addr = start_addr + i * 4;
+        auto result = try_access(logical_addr, mmu::Access::store);
+        if (std::holds_alternative<Fault>(result)) {
+            return Killed{Signal{abi::kSigsegv}};
+        }
+        if (std::holds_alternative<Blocked>(result)) {
+            return Switch{};
+        }
+        uint32_t physical_addr = std::get<uint32_t>(result);
+        ram().write(physical_addr, 4, i == 0 ? ctx.pc : ctx.regs[i]);
+    }
+    return Continue{};
+}
+
+std::variant<Continue, Switch, Killed> Kernel::read_context(uint32_t start_addr, cpu::Context& ctx) {
+    for (uint32_t i = 0; i < 32; ++i) {
+        uint32_t logical_addr = start_addr + i * 4;
+        auto result = try_access(logical_addr, mmu::Access::load);
+        if (std::holds_alternative<Fault>(result)) {
+            return Killed{Signal{abi::kSigsegv}};
+        }
+        if (std::holds_alternative<Blocked>(result)) {
+            return Switch{};
+        }
+        uint32_t physical_addr = std::get<uint32_t>(result);
+        uint32_t& entry = i == 0 ? ctx.pc : ctx.regs[i];
+        entry = *ram().read(physical_addr, 4);
+    }
+    return Continue{};
+}
+
+// signal 
+std::variant<Continue, Switch, Killed> Kernel::deliver_signal() {
+    uint32_t& pending_flags = process().pending_flags;
+    if (pending_flags == 0) {
+        return Continue{};
+    }
+    uint32_t sig = std::countr_zero(pending_flags);
+    SignalAction signal_action = process().signal_actions[sig];
+    assert(signal_action.handler != abi::kSigIgnore);
+    if (signal_action.handler == abi::kSigDefault) {
+        pending_flags ^= (1 << sig);
+        return Killed{Signal{sig}};
+    }
+    auto result = run_handler(sig);
+    if (std::holds_alternative<Continue>(result)) {
+        pending_flags ^= (1 << sig);
+    }
+    return result;
+}
+
+std::variant<Continue, Switch, Killed> Kernel::run_handler(uint32_t sig) {
+    SignalAction signal_action = process().signal_actions[sig];
+    uint32_t sp = cpu().reg(isa::reg::sp);
+    uint32_t next_sp = (sp & ~15) - 128;
+    auto write_result = write_context(next_sp, cpu().context());
+    if (std::holds_alternative<Switch>(write_result)) {
+        return Switch{};
+    }
+    if (std::holds_alternative<Killed>(write_result)) {
+        return write_result;
+    }
+    sp = next_sp;
+    cpu().set_reg(isa::reg::sp, sp);
+    cpu().set_reg(isa::reg::a0, sig);
+    cpu().set_reg(isa::reg::ra, signal_action.restorer);
+    cpu().pc = signal_action.handler;
+    return Continue{};
+}
 
 uint32_t Kernel::create_process(Process&& process, const cpu::Context& context) {
     uint32_t pid = ++next_pid_;
@@ -56,6 +130,16 @@ std::variant<Exited, Killed, Continue, Switch, ThreadExited> Kernel::handle_trap
                              std::holds_alternative<Killed>(result) ? "killed" :
                              std::holds_alternative<Switch>(result) ? "switched: waiting" : "handled");
             }
+            if (std::holds_alternative<Killed>(result)) {
+                SignalAction action = process().signal_actions[abi::kSigsegv];
+                if (action.handler != abi::kSigDefault && action.handler != abi::kSigIgnore) {
+                    auto handler_result = run_handler(abi::kSigsegv);
+                    return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(handler_result);
+                } else {
+                    return Killed{trap};
+                }
+            }
+            
             return result;
         }
         default :
@@ -250,6 +334,18 @@ void Kernel::load_thread(Thread& thread) {
 
 // Runs the next thread for one turn; returns how many of max_steps are left.
 uint64_t Kernel::run_helper(uint64_t max_steps) {
+    auto deliver = [this] () {
+        auto deliver_result = deliver_signal();
+        if (const auto* killed = std::get_if<Killed>(&deliver_result)) {
+            end_all_threads(process(), *killed);
+            return true;
+        }
+        if (std::holds_alternative<Switch>(deliver_result)) {
+            save_thread(thread());
+            return true;
+        }
+        return false;
+    };
     Thread* maybe_thread = find_next_thread(executing_tid_);
     if (!maybe_thread) { // every thread is blocked: wait for an interrupt
         uint64_t old_steps = machine_.steps();
@@ -272,6 +368,8 @@ uint64_t Kernel::run_helper(uint64_t max_steps) {
         return max_steps;
     }
     load_thread(thread);
+    if (deliver()) return max_steps;
+    
     machine_.set_timer(machine_.steps() + kQuantum);
     // repeatedly run the thread
     while (true) {
@@ -289,6 +387,7 @@ uint64_t Kernel::run_helper(uint64_t max_steps) {
                 save_thread(thread);
                 return max_steps;
             } else if (std::holds_alternative<Continue>(handle_result)) {
+                if (deliver()) return max_steps;
                 continue;
             } else if (auto* exited = std::get_if<Exited>(&handle_result)) {
                 // end_process(process(), *exited);

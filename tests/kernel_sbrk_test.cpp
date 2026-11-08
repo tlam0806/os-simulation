@@ -57,7 +57,7 @@ int32_t exit_status(const Result& r) {
 cpu::Trap killed_by(const Result& r) {
     const auto* k = std::get_if<kernel::Killed>(&r);
     CHECK(k != nullptr);
-    return k ? k->trap : cpu::Trap{};
+    return k ? std::get<cpu::Trap>(k->reason) : cpu::Trap{};
 }
 
 }  // namespace

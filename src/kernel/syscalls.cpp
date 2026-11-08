@@ -10,14 +10,14 @@
 
 namespace kernel {
 
-std::variant<Exited, Continue, Switch, ThreadExited> Kernel::handle_syscall() {
+std::variant<Exited, Killed, Continue, Switch, ThreadExited> Kernel::handle_syscall() {
     cpu().pc += 4;   // every call that resumes continues after the ecall
     uint32_t a7_value = cpu().reg(isa::reg::a7);
     switch (a7_value) {
         case abi::kSysExit :
             return sys_exit();
         case abi::kSysWrite :
-            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_write());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_write());
         case abi::kSysSbrk :
             return sys_sbrk();
         case abi::kSysGetpid :
@@ -27,21 +27,21 @@ std::variant<Exited, Continue, Switch, ThreadExited> Kernel::handle_syscall() {
         case abi::kSysFork : 
             return sys_fork();
         case abi::kSysWait :
-            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_wait());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_wait());
         case abi::kSysDiskRead :
-            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_disk_read());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_disk_read());
         case abi::kSysDiskWrite :
-            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_disk_write());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_disk_write());
         case abi::kSysOpen : 
-            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_open());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_open());
         case abi::kSysClose :
             return sys_close();
         case abi::kSysLseek :
-            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_lseek());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_lseek());
         case abi::kSysRead : 
-            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_read());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_read());
         case abi::kSysExec :
-            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_exec());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_exec());
         case abi::kSysThreadCreate :
             return sys_thread_create();
         case abi::kSysGettid : 
@@ -49,9 +49,9 @@ std::variant<Exited, Continue, Switch, ThreadExited> Kernel::handle_syscall() {
         case abi::kSysThreadExit : 
             return sys_thread_exit();
         case abi::kSysThreadJoin : 
-            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_thread_join());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_thread_join());
         case abi::kSysPipe :
-            return util::convert_variant<Exited, Continue, Switch, ThreadExited>(sys_pipe());
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_pipe());
         case abi::kSysShmget :
             return sys_shmget();
         case abi::kSysShmrm : 
@@ -60,9 +60,78 @@ std::variant<Exited, Continue, Switch, ThreadExited> Kernel::handle_syscall() {
             return sys_shmat();
         case abi::kSysShmdt : 
             return sys_shmdt();
+        case abi::kSysSignal :
+            return sys_signal();
+        case abi::kSysKill : 
+            return sys_kill();
+        case abi::kSysSigreturn :
+            return util::convert_variant<Exited, Killed, Continue, Switch, ThreadExited>(sys_sig_return());
         default :
             return sys_other();
     }
+}
+
+std::variant<Continue, Switch, Killed> Kernel::sys_sig_return() {
+    uint32_t sp = cpu().reg(isa::reg::sp);
+    cpu::Context context{};
+    auto read_result = read_context(sp, context);
+    if (std::holds_alternative<Killed>(read_result)) {
+        return read_result;
+    }
+    if (std::holds_alternative<Switch>(read_result)) {
+        return read_result;
+    }
+    cpu().set_context(context);
+    return Continue{};
+}
+
+Continue Kernel::sys_kill() {
+    uint32_t pid = cpu().reg(isa::reg::a0);
+    uint32_t sig = cpu().reg(isa::reg::a1);
+    if (sig != abi::kSigkill && sig != abi::kSigusr1 && sig != abi::kSigsegv && sig != abi::kSigusr2 && sig != abi::kSigpipe) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
+        return Continue{};
+    }
+    auto it = process_table_.find(pid);
+    if (it == process_table_.end()) { // no running process with that pid 
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEsrch));
+        return Continue{};
+    }
+    Process& process = it->second;
+    if (process.status) { // the process already ended
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEsrch));
+        return Continue{};
+    }
+    cpu().set_reg(isa::reg::a0, 0);
+    SignalAction signal_action = process.signal_actions[sig];
+    if (signal_action.handler == abi::kSigIgnore) {
+        return Continue{};
+    }
+    if (pid != this->process().pid && signal_action.handler == abi::kSigDefault) {
+        end_all_threads(process, Killed{Signal{sig}});
+        return Continue{};
+    }
+    process.pending_flags |= (1 << sig);
+    for (uint32_t tid : process.threads) {
+        Thread& thread = thread_table_[tid];
+        if (thread.blocked != BlockReason::IO) {
+            thread.blocked = BlockReason::None;
+        }
+    }
+    return Continue{};
+}
+
+Continue Kernel::sys_signal() {
+    uint32_t sig = cpu().reg(isa::reg::a0);
+    uint32_t handler = cpu().reg(isa::reg::a1);
+    uint32_t restorer = cpu().reg(isa::reg::a2);
+    if (sig != abi::kSigusr1 && sig != abi::kSigsegv && sig != abi::kSigusr2 && sig != abi::kSigpipe) {
+        cpu().set_reg(isa::reg::a0, static_cast<uint32_t>(-abi::kEinval));
+        return Continue{};
+    }
+    process().signal_actions[sig] = SignalAction{handler, restorer};
+    cpu().set_reg(isa::reg::a0, 0);
+    return Continue{};
 }
 
 Continue Kernel::sys_shmdt() {
@@ -381,9 +450,14 @@ std::variant<Continue, Switch> Kernel::sys_wait() {
         auto it = ending_table_.find(pid);
         assert(it != ending_table_.end());
         Ending& end = it->second;
-        int32_t end_status = std::holds_alternative<Exited>(end.status) 
-            ? std::get<Exited>(end.status).exit_status 
-            : static_cast<int32_t>(std::get<Killed>(end.status).trap.cause) + 128;
+        int32_t end_status = 0;
+        if (const auto* exited = std::get_if<Exited>(&end.status)) {
+            end_status = exited->exit_status;
+        } else if (const auto* trap = std::get_if<cpu::Trap>(&std::get<Killed>(end.status).reason)) {
+            end_status = static_cast<int32_t>(trap->cause) + 128;           // a fault
+        } else {
+            end_status = static_cast<int32_t>(std::get<Signal>(std::get<Killed>(end.status).reason).number) + 256;
+        }
         uint32_t addr = cpu().reg(isa::reg::a1);
         if (addr == 0) {
             end.collected = true;

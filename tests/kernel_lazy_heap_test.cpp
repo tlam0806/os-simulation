@@ -151,8 +151,8 @@ TEST(lazy_heap_past_the_break_page_still_segfaults) {
     const auto* killed = e ? std::get_if<kernel::Killed>(&e->status) : nullptr;
     CHECK(killed != nullptr);
     if (killed) {
-        CHECK_EQ(killed->trap.cause, cpu::Cause::load_page_fault);
-        CHECK_EQ(killed->trap.tval, kInitialBreak + 4096);
+        CHECK_EQ(std::get<cpu::Trap>(killed->reason).cause, cpu::Cause::load_page_fault);
+        CHECK_EQ(std::get<cpu::Trap>(killed->reason).tval, kInitialBreak + 4096);
     }
 }
 

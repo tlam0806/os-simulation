@@ -41,7 +41,9 @@ int32_t exit_status(const Result& r) {
 cpu::Trap killed_by(const Result& r) {
     const auto* killed = std::get_if<kernel::Killed>(&r);
     CHECK(killed != nullptr);
-    return killed ? killed->trap : cpu::Trap{};
+    const auto* trap = killed ? std::get_if<cpu::Trap>(&killed->reason) : nullptr;
+    CHECK(trap != nullptr);
+    return trap ? *trap : cpu::Trap{};
 }
 
 }  // namespace

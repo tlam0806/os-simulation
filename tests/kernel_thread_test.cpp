@@ -621,7 +621,7 @@ TEST(thread_end_a_fault_kills_the_whole_process) {
     CHECK(e.has_value());
     const auto* killed = e ? std::get_if<kernel::Killed>(&e->status) : nullptr;
     CHECK(killed != nullptr);
-    if (killed) CHECK_EQ(killed->trap.cause, cpu::Cause::load_page_fault);
+    if (killed) CHECK_EQ(std::get<cpu::Trap>(killed->reason).cause, cpu::Cause::load_page_fault);
     CHECK_EQ(s.m.frame_allocator().free_count(), mmu::kNumFrames);
 }
 
@@ -636,7 +636,7 @@ TEST(thread_end_a_bad_entry_kills_the_whole_process) {
     CHECK(e.has_value());
     const auto* killed = e ? std::get_if<kernel::Killed>(&e->status) : nullptr;
     CHECK(killed != nullptr);
-    if (killed) CHECK_EQ(killed->trap.cause, cpu::Cause::instruction_page_fault);
+    if (killed) CHECK_EQ(std::get<cpu::Trap>(killed->reason).cause, cpu::Cause::instruction_page_fault);
 }
 
 TEST(thread_end_exit_with_a_sibling_waiting_on_the_disk) {
