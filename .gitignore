@@ -12,3 +12,6 @@ compile_commands.json
 
 # macOS
 .DS_Store
+# Course material (not for redistribution)
+Lectures_export/
+Lectures_export.zip
